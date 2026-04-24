@@ -976,7 +976,7 @@ rm -f instance-trust.json userdata.sh backup-trust.json fis-trust.json
 | **Lifecycle hooks** | Launch hooks for initialization, terminate hooks for draining. `Pending:Wait` → signal CONTINUE/ABANDON. |
 | **Scaling policies** | Target tracking (recommended default), step scaling (fine-grained), scheduled (predictable), predictive (ML). |
 | **SQS-based scaling** | Scale ASG on `ApproximateNumberOfMessagesVisible`. Classic decoupling pattern. |
-| **ECS resilience** | Circuit breaker for failed deployments. Capacity providers for ASG scaling. Fargate for serverless. |
+| **ECS resilience** | Circuit breaker for failed deployments. Capacity providers for ASG scaling. Fargate for serverless. Native blue/green, canary, and linear deployments (Oct 2025). |
 | **Route 53 failover** | Health checks (endpoint, calculated, CloudWatch alarm) + failover routing. `EvaluateTargetHealth` on alias records. |
 | **DR strategies** | Backup & Restore (hours/$), Pilot Light (minutes/$$), Warm Standby (minutes/$$$), Active-Active (seconds/$$$$). |
 | **AWS Backup** | Centralized backup. Plans + vaults + selections. Cross-Region and cross-account copy. |

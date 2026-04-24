@@ -1202,7 +1202,7 @@ This is not a build lab. It's a decision-making exercise. For each scenario, dec
 <details>
 <summary>Reveal answer</summary>
 
-**Blue/Green with CodeDeploy for ECS.** Configure a test listener on the ALB. Use the `AfterAllowTestTraffic` hook to run validation against the test listener. Only after validation passes does production traffic shift. If validation fails, the deployment rolls back — production traffic never touches the new task set.
+**Blue/Green with CodeDeploy for ECS** (or ECS-native blue/green, available since October 2025). Configure a test listener on the ALB. Use the `AfterAllowTestTraffic` hook to run validation against the test listener. Only after validation passes does production traffic shift. If validation fails, the deployment rolls back — production traffic never touches the new task set. Note: ECS now also supports native canary and linear deployments without CodeDeploy.
 
 </details>
 
@@ -1276,6 +1276,7 @@ rm -f ec2-trust-policy.json codedeploy-trust-policy.json lambda-trust.json \
 | **AppSpec (EC2)** | Lifecycle hook order: `ApplicationStop → DownloadBundle → BeforeInstall → Install → AfterInstall → ApplicationStart → ValidateService` |
 | **AppSpec (Lambda)** | `BeforeAllowTraffic` and `AfterAllowTraffic` hooks. Alias routing weights for canary. |
 | **AppSpec (ECS)** | `AfterAllowTestTraffic` hook for validation before production traffic shift. |
+| **ECS native deployments** | As of October 2025, ECS supports built-in blue/green, canary, and linear deployments natively — without CodeDeploy. ECS-native is now the recommended default for new deployments. CodeDeploy for ECS is still supported and may appear on the exam. |
 | **Deployment strategies** | Blue/green = zero downtime + instant rollback. Canary = lowest risk. Immutable = no drift. All-at-once = fastest. |
 | **Rollback** | CodeDeploy rollback = new deployment of previous revision (not a revert). Can be triggered by CloudWatch alarms. |
 | **Storage patterns** | EFS for shared state across instances. EBS for per-instance state. S3 for artifacts and static assets. |
