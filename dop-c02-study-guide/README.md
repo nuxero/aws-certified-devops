@@ -20,12 +20,33 @@ A practical, lab-driven study guide for the DOP-C02 certification exam. Every se
 | [09 — IAM & Security at Scale](./09-iam-security-at-scale.md) | Security & Compliance (17%) | Permissions boundaries for delegated admin, cross-account access (role assumption vs. resource policies), Secrets Manager rotation, IAM Access Analyzer, ABAC policy-writing exercises |
 | [10 — Data Protection & Auditing](./10-data-protection-auditing.md) | Security & Compliance (17%) | KMS key management with rotation and cross-account access, WAF Web ACL (IP blocking, rate limiting, managed rules), GuardDuty with automated response, CloudTrail with log integrity validation, security service identification exercise |
 
+## Dev Environment (Nix + direnv)
+
+This repo includes a Nix flake that sets up everything you need. If you have [Nix](https://nixos.org/) and [direnv](https://direnv.net/) installed, just `cd` into the repo:
+
+```bash
+direnv allow
+```
+
+That's it. The shell automatically provides:
+
+- AWS CLI v2, SAM CLI, SSM Session Manager plugin
+- Node.js 22 (LTS) with AWS CDK CLI
+- Python 3.12
+- Docker, Git, jq, zip, curl, wget
+- `AWS_PROFILE=hector-experiments` set automatically
+
+On first load, the CDK CLI installs via npm into a local `.npm-global/` directory (cached for subsequent sessions).
+
+If you don't use Nix, install the tools manually — see the prerequisites below.
+
 ## Prerequisites
 
 - An AWS account (free tier covers most labs; budget ~$10–15 total for the full guide)
 - AWS CLI v2 installed and configured
-- Git, Node.js 18+, Python 3.9+, Docker
+- Git, Node.js 22+ (LTS), Python 3.9+, Docker
 - AWS SAM CLI and AWS CDK CLI (`npm install -g aws-cdk`)
+- SSM Session Manager plugin (for Session Manager labs in Session 4)
 
 ## How to Use This Guide
 
@@ -61,3 +82,11 @@ Each session includes a cleanup section. Run it when you're done to avoid ongoin
 - [Official AWS DOP-C02 Exam Guide](https://docs.aws.amazon.com/aws-certification/latest/examguides/devops-engineer-professional-02.html)
 - [AWS Documentation](https://docs.aws.amazon.com/)
 - Content was rephrased for compliance with licensing restrictions.
+
+## Recent AWS Updates Reflected
+
+This guide was validated against current AWS documentation as of April 2026:
+
+- **CodeCommit** returned to full General Availability in January 2025 after AWS reversed its July 2024 de-emphasis. It's open to new customers again.
+- **Amazon ECS** now supports built-in blue/green, canary, and linear deployments natively (October 2025) without requiring CodeDeploy. ECS-native is the recommended default for new deployments; CodeDeploy for ECS is still supported and may appear on the exam.
+- Exam details (75 questions, 180 minutes, 750/1000 passing, $300, 6 domains with published weights) confirmed against the official exam guide and multiple preparation sources.
