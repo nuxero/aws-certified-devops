@@ -1,0 +1,96 @@
+{
+    "pipeline": {
+        "name": "cross-account-app-pipeline",
+        "roleArn": "arn:aws:iam::768330363917:role/CrossAccountLab-CodePipelineRole",
+        "artifactStore": {
+            "type": "S3",
+            "location": "cross-account-pipeline-artifacts-768330363917",
+            "encryptionKey": {
+                "id": "arn:aws:kms:us-east-1:768330363917:key/9ad99a03-2cfa-4fce-81f7-2a2bd4ade623",
+                "type": "KMS"
+            }
+        },
+        "stages": [
+            {
+                "name": "Source",
+                "actions": [
+                    {
+                        "name": "CodeCommitSource",
+                        "actionTypeId": {
+                            "category": "Source",
+                            "owner": "AWS",
+                            "provider": "CodeCommit",
+                            "version": "1"
+                        },
+                        "runOrder": 1,
+                        "configuration": {
+                            "BranchName": "main",
+                            "PollForSourceChanges": "false",
+                            "RepositoryName": "cross-account-app"
+                        },
+                        "outputArtifacts": [
+                            {
+                                "name": "SourceOutput"
+                            }
+                        ],
+                        "inputArtifacts": []
+                    }
+                ]
+            },
+            {
+                "name": "Build",
+                "actions": [
+                    {
+                        "name": "DockerBuild",
+                        "actionTypeId": {
+                            "category": "Build",
+                            "owner": "AWS",
+                            "provider": "CodeBuild",
+                            "version": "1"
+                        },
+                        "runOrder": 1,
+                        "configuration": {
+                            "ProjectName": "cross-account-app-build"
+                        },
+                        "outputArtifacts": [
+                            {
+                                "name": "BuildOutput"
+                            }
+                        ],
+                        "inputArtifacts": [
+                            {
+                                "name": "SourceOutput"
+                            }
+                        ]
+                    }
+                ]
+            },
+            {
+                "name": "Deploy-Production",
+                "actions": [
+                    {
+                    "name": "DeployToECS",
+                    "actionTypeId": {
+                        "category": "Deploy",
+                        "owner": "AWS",
+                        "provider": "ECS",
+                        "version": "1"
+                    },
+                    "inputArtifacts": [
+                        { "name": "BuildOutput" }
+                    ],
+                    "configuration": {
+                        "ClusterName": "cross-account-prod-cluster",
+                        "ServiceName": "cross-account-app-service",
+                        "FileName": "imagedefinitions.json"
+                    },
+                    "roleArn": "arn:aws:iam::564146030852:role/CrossAccountPipelineRole"
+                    }
+                ]
+            }
+        ],
+        "version": 1,
+        "executionMode": "SUPERSEDED",
+        "pipelineType": "V2"
+    }
+}

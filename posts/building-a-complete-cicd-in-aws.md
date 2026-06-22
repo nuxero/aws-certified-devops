@@ -54,7 +54,7 @@ We are using the official Alpine Linux version of Node.js 24 as our base image t
 
 ```dockerfile
 # Start from the secure and lightweight Alpine Linux Node.js 24 image
-FROM node:24-alpine
+FROM public.ecr.aws/docker/library/node:24-alpine
 WORKDIR /usr/src/app
 # Copy our modern index.mjs application code into the container
 COPY index.mjs ./
