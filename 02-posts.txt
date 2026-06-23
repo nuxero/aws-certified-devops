@@ -1,0 +1,19 @@
+post #1: CI in CD Explained: Running MultiStage Builds In AWS using Codebuild
+
+An explanation of the importance of CI and a step by step guide that shows how to set up a multistage test suite in CodeBuild
+
+post #2: ECR Deep Dive
+
+A post showing the capabilties of ECR: scan-on-push, lifecycle rules and cross-account/cross-region replication.
+
+post #3: Understanding CodeArtifact
+
+Defining what the CodeArtifact service allows and understanding it's features. A step by step guide of a basic, standard workflow
+
+post #4: Deploy Anywhere with CodeDeploy
+
+Explain what CodeDeploy is and its capabilities. Show a step by step guide to deploy a basic web application to an EC2 instance, ECS Fargate and Lambda
+
+post #5: CodeDeploy Deployment Strategies
+
+List and explain the multiple deployment strategies supported by CodeDeploy: All-at-Once, Canary, Rolling, Immutable and Blue/Green

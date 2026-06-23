@@ -1,0 +1,110 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Prerequisites for the multi-stage CodeBuild testing lab.
+  Creates a CodeCommit repo, S3 artifact bucket, IAM role, and CodeBuild project.
+
+Resources:
+  # S3 bucket to store build artifacts produced by CodeBuild
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'codebuild-testing-lab-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+
+  # IAM role that CodeBuild assumes during builds — scoped to only what's needed
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CodeBuildTestingLabRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildTestingLabPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Allow CodeBuild to write build logs to CloudWatch
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/multi-stage-testing-lab'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/multi-stage-testing-lab:*'
+              # Allow CodeBuild to read/write artifacts to the S3 bucket
+              - Sid: S3Artifacts
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::codebuild-testing-lab-${AWS::AccountId}/*'
+              # Allow CodeBuild to pull source code from the CodeCommit repository
+              - Sid: CodeCommitAccess
+                Effect: Allow
+                Action:
+                  - codecommit:GitPull
+                Resource:
+                  - !GetAtt CodeCommitRepo.Arn
+              # Allow CodeBuild to create and populate test report groups
+              - Sid: TestReports
+                Effect: Allow
+                Action:
+                  - codebuild:CreateReportGroup
+                  - codebuild:CreateReport
+                  - codebuild:UpdateReport
+                  - codebuild:BatchPutTestCases
+                  - codebuild:BatchPutCodeCoverages
+                Resource:
+                  - !Sub 'arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/multi-stage-testing-lab-*'
+
+  # Empty CodeCommit repository — we'll push application code here later
+  CodeCommitRepo:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: multi-stage-testing-lab
+      RepositoryDescription: Application code for the multi-stage CodeBuild testing lab
+
+  # CodeBuild project configured to pull from CodeCommit and use the standard Amazon Linux image
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: multi-stage-testing-lab
+      Description: Multi-stage testing lab with unit and integration test gates
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: S3
+        Location: !Ref ArtifactBucket
+        Packaging: ZIP
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+      Source:
+        Type: CODECOMMIT
+        Location: !GetAtt CodeCommitRepo.CloneUrlHttp
+      SourceVersion: refs/heads/main
+      TimeoutInMinutes: 10
+
+Outputs:
+  RepositoryCloneUrl:
+    Description: CodeCommit SSH clone URL
+    Value: !GetAtt CodeCommitRepo.CloneUrlSsh
+  ProjectName:
+    Description: CodeBuild project name
+    Value: !Ref CodeBuildProject
+  ArtifactBucket:
+    Description: S3 bucket for build artifacts
+    Value: !Ref ArtifactBucket
+  ServiceRoleArn:
+    Description: CodeBuild IAM service role ARN
+    Value: !GetAtt CodeBuildServiceRole.Arn
