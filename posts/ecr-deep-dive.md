@@ -145,6 +145,8 @@ Resources:
                   - ecr:UploadLayerPart
                   - ecr:CompleteLayerUpload
                   - ecr:DescribeImageScanFindings
+                  - ecr:StartImageScan
+                  - ecr:DescribeImages
                 Resource: !GetAtt ECRRepository.Arn
               # ECR login requires registry-level permission
               - Sid: ECRAuth
@@ -170,6 +172,12 @@ Resources:
                   - s3:GetObjectVersion
                 Resource:
                   - !Sub 'arn:aws:s3:::ecr-deep-dive-${AWS::AccountId}/*'
+              # Allow signing images when managed signing is enabled
+              - Sid: SignerAccess
+                Effect: Allow
+                Action:
+                  - signer:SignPayload
+                Resource: '*'
 
   # CodeBuild project that builds a Docker image and pushes it to ECR
   CodeBuildProject:
@@ -329,9 +337,9 @@ phases:
   build:
     commands:
       # Build the Docker image using the multi-stage Dockerfile
-      - echo "Building Docker image..."
-      - docker build -t $REPOSITORY_URI:v1.0.0 .
-      - docker tag $REPOSITORY_URI:v1.0.0 $REPOSITORY_URI:latest
+      # Tag uses the build number — unique per build, works with immutable tags
+      - echo "Building image with tag v$CODEBUILD_BUILD_NUMBER..."
+      - docker build -t $REPOSITORY_URI:v$CODEBUILD_BUILD_NUMBER .
 
   post_build:
     commands:
@@ -341,19 +349,34 @@ phases:
           echo "Build failed — skipping push"
           exit 1
         fi
-      # Push both tags to ECR — this triggers scan-on-push
+      # Push the tagged image to ECR — this triggers scan-on-push
       - echo "Pushing image to ECR..."
-      - docker push $REPOSITORY_URI:v1.0.0
-      - docker push $REPOSITORY_URI:latest
-      # Wait for the scan to complete (basic scan takes ~30 seconds)
-      - echo "Waiting for scan results..."
-      - sleep 30
+      - docker push $REPOSITORY_URI:v$CODEBUILD_BUILD_NUMBER
+      # Trigger a scan and wait for results
+      - echo "Scanning image for vulnerabilities..."
       - |
+        # Explicitly trigger a scan — more reliable than relying on scan-on-push timing
+        aws ecr start-image-scan \
+          --repository-name ecr-deep-dive-app \
+          --image-id imageTag=v$CODEBUILD_BUILD_NUMBER || true
+
+        # Wait for the scan to finish — polls every 5s, up to 5 minutes
+        aws ecr wait image-scan-complete \
+          --repository-name ecr-deep-dive-app \
+          --image-id imageTag=v$CODEBUILD_BUILD_NUMBER
+
+        # Query the CRITICAL finding count
+        # --output text returns "None" when the key doesn't exist (no CRITICAL findings)
         CRITICAL=$(aws ecr describe-image-scan-findings \
           --repository-name ecr-deep-dive-app \
-          --image-id imageTag=v1.0.0 \
-          --query 'imageScanFindings.findingSeverityCounts.CRITICAL // `0`' \
-          --output text 2>/dev/null || echo "0")
+          --image-id imageTag=v$CODEBUILD_BUILD_NUMBER \
+          --query 'imageScanFindings.findingSeverityCounts.CRITICAL' \
+          --output text)
+
+        if [ "$CRITICAL" = "None" ] || [ -z "$CRITICAL" ]; then
+          CRITICAL=0
+        fi
+
         echo "Critical vulnerabilities found: $CRITICAL"
         if [ "$CRITICAL" -gt 0 ]; then
           echo "CRITICAL vulnerabilities detected — failing build"
@@ -400,13 +423,13 @@ With an image in the repository, we can now explore each feature.
 
 ## Vulnerability Scanning — Basic vs. Enhanced
 
-ECR offers two scanning modes, and understanding the difference is critical for production operations.
+ECR can scan every image you push for known vulnerabilities. With `scanOnPush: true` (already enabled in our CloudFormation template), a scan triggers automatically every time an image lands in the repository.
 
 ### Basic Scanning
 
-Basic scanning runs once per push — when you push an image, ECR scans it for known OS package vulnerabilities using the open-source [Clair](https://github.com/quay/clair) CVE database. It's free, automatic (if `scanOnPush` is enabled), and covers operating system packages only (apt, yum, apk).
+Basic scanning checks your image's OS packages against the Common Vulnerabilities and Exposures (CVE) database. It's free, triggers immediately on push, and covers packages installed via apt, yum, and apk.
 
-Since we already pushed an image with `scanOnPush: true`, the scan has already run. Query the results to see what it found. This command retrieves the severity breakdown for our v1.0.0 image:
+Since we already pushed an image with `scanOnPush: true`, the scan has already run. Query the results to see what it found. This command retrieves the severity breakdown for our image:
 
 ```bash
 # Check scan results for our pushed image
@@ -426,46 +449,40 @@ You'll see output like:
 {
   "Status": "COMPLETE",
   "SeverityCounts": {
-    "CRITICAL": 2,
-    "HIGH": 15,
-    "MEDIUM": 42,
-    "LOW": 12,
-    "INFORMATIONAL": 3
+    "HIGH": 24,
+    "MEDIUM": 19,
+    "LOW": 3,
+    "CRITICAL": 3
   },
-  "TotalFindings": 74
+  "TotalFindings": 49
 }
 ```
 
-The numbers will vary depending on when you run this — new CVEs are published constantly. The important thing: basic scanning found OS-level vulnerabilities in our `node:18-slim` base image. But it missed anything in our `node_modules/` — that's where enhanced scanning comes in.
+The numbers will vary depending on when you run this — new CVEs are published constantly. The important thing: basic scanning found OS-level vulnerabilities in our `node:18-slim` base image.
 
 ### Enhanced Scanning (Amazon Inspector)
 
-Enhanced scanning is powered by [Amazon Inspector](https://aws.amazon.com/inspector/). It scans both OS packages AND programming language packages (npm, pip, Maven, Go modules, etc.), and it does so continuously — meaning images are re-scanned automatically when new vulnerabilities are disclosed, not just at push time.
+Basic scanning covers OS packages only. If you also need to scan language-level dependencies (npm, pip, Maven, Go modules), ECR integrates with [Amazon Inspector](https://aws.amazon.com/inspector/) for enhanced scanning. Enhanced scanning adds:
 
-Enhanced scanning is configured at the registry level — it applies to all repositories (or a filtered subset). Enable it with this command, which switches your entire registry from basic to enhanced scanning:
+- **Language package vulnerabilities** — finds CVEs in your `node_modules/`, Python packages, Java JARs, etc.
+- **Continuous re-scanning** — images are re-evaluated when new CVEs are published, not just at push time
+
+Enhanced scanning is configured at the registry level:
 
 ```bash
-# Enable enhanced scanning at the registry level
-# This converts all repositories from basic to Inspector-powered scanning
 aws ecr put-registry-scanning-configuration \
   --scan-type ENHANCED \
   --rules '[{"scanFrequency": "CONTINUOUS_SCAN", "repositoryFilters": [{"filter": "*", "filterType": "WILDCARD"}]}]'
 ```
 
-The `CONTINUOUS_SCAN` frequency means Inspector re-scans existing images when new CVEs are published. You can also use `SCAN_ON_PUSH` for enhanced scanning that only triggers on push (saves cost if continuous isn't needed).
+Trade-offs compared to basic:
 
-To limit enhanced scanning to specific repositories (useful for cost control — skip dev/scratch repos), use repository filters:
+- Costs money (per image/month)
+- Requires additional IAM permissions (`inspector2:ListFindings`, `inspector2:ListCoverage`, `inspector2:ListAccountPermissions`)
+- Scan registration is asynchronous — there's a delay between push and when findings are available, which adds complexity to CI/CD gating logic
+- Switching between basic and enhanced invalidates previously established scans
 
-```bash
-# Only apply enhanced scanning to repositories matching "prod-*"
-aws ecr put-registry-scanning-configuration \
-  --scan-type ENHANCED \
-  --rules '[{"scanFrequency": "CONTINUOUS_SCAN", "repositoryFilters": [{"filter": "prod-*", "filterType": "WILDCARD"}]}]'
-```
-
-After enabling enhanced scanning, findings appear in both the ECR console and the Amazon Inspector console. Inspector gives you a unified view across ECR images, EC2 instances, and Lambda functions — one dashboard for all vulnerabilities in your account.
-
-**What enhanced scanning adds over basic:**
+You can limit enhanced scanning to specific repositories using filters — scan `prod-*` continuously, leave `dev-*` on basic to save cost.
 
 | Capability | Basic | Enhanced |
 |-----------|-------|----------|
@@ -475,18 +492,26 @@ After enabling enhanced scanning, findings appear in both the ECR console and th
 | Inspector dashboard integration | ❌ | ✅ |
 | Maps images to running ECS tasks / EKS pods | ❌ | ✅ |
 | Cost | Free | Per image/month |
+| Scan availability after push | Immediate | Delayed (seconds to minutes) |
 
 ### Pipeline Integration — Gating on Scan Results
 
-The buildspec we created earlier already includes a scan gate in `post_build`. The pattern is straightforward: push the image, wait for the scan, query findings, fail the build if critical vulnerabilities exist. Here's the key snippet isolated for clarity. This queries the scan findings API and exits with a non-zero code if any CRITICAL vulnerabilities are found — which fails the CodeBuild phase and stops the pipeline:
+The buildspec we created earlier includes a scan gate in `post_build`. The pattern: push the image, wait for the scan to complete, query findings, fail the build if critical vulnerabilities exist. Here's the key snippet isolated for clarity:
 
 ```bash
-# Wait for scan to complete, then gate on results
+# Wait for scan to complete using the official ECR waiter
+aws ecr wait image-scan-complete \
+  --repository-name ecr-deep-dive-app \
+  --image-id imageTag=v1.0.0
+
+# Query CRITICAL count — --output text returns "None" if the key doesn't exist
 CRITICAL=$(aws ecr describe-image-scan-findings \
   --repository-name ecr-deep-dive-app \
   --image-id imageTag=v1.0.0 \
-  --query 'imageScanFindings.findingSeverityCounts.CRITICAL // `0`' \
+  --query 'imageScanFindings.findingSeverityCounts.CRITICAL' \
   --output text)
+
+if [ "$CRITICAL" = "None" ] || [ -z "$CRITICAL" ]; then CRITICAL=0; fi
 
 # Fail the build if any CRITICAL vulnerabilities exist
 if [ "$CRITICAL" -gt 0 ]; then
@@ -502,9 +527,17 @@ fi
 echo "Scan passed — no critical vulnerabilities"
 ```
 
-For enhanced scanning, findings are available through the Inspector API instead. The `aws ecr describe-image-scan-findings` command still works, but Inspector's `list-findings` gives you richer data including CVSS scores and remediation guidance.
-
 **Why fail the build if the image is already pushed?** The image exists in ECR regardless — the scan gate doesn't prevent storage, it prevents *deployment*. In a CodePipeline (Source → Build → Deploy), a failed Build stage stops the Deploy stage from ever running. The vulnerable image sits in the registry undeployed until a lifecycle policy cleans it up. If you want to go further and prevent the image from being pullable at all, you'd need a separate EventBridge rule that deletes or quarantines images when Inspector reports critical findings — but most teams just let the pipeline gate handle it.
+
+### Alternative Approaches
+
+The pattern above (push → scan → gate in the same build) is the simplest AWS-native approach. In production, teams commonly use one of these alternatives:
+
+- **Scan before push with Trivy or Grype** — run a local scanner during the build phase, before the image ever reaches ECR. Fastest feedback loop, no async timing issues, catches both OS and language vulnerabilities regardless of ECR scanning mode. The downside: requires installing a third-party tool in your build environment.
+- **Event-driven gate with EventBridge + Lambda** — push the image, let scan-on-push fire asynchronously, and use an EventBridge rule to catch the `ECR Image Scan` completion event. A Lambda evaluates findings and either approves the next pipeline stage or quarantines the image. More infrastructure to manage, but fully decoupled — the build finishes fast and the gate is handled externally.
+- **CodePipeline InspectorScan action** — CodePipeline has a native `InspectorScan` action type that scans source code and container SBOMs as a pipeline stage. Useful if you want scanning as a discrete pipeline stage rather than embedded in the build.
+
+Each approach has trade-offs between simplicity, speed, and coverage. For this post, we use the explicit `start-image-scan` + waiter pattern because it demonstrates ECR's built-in capabilities without external tooling or extra infrastructure.
 
 ## Lifecycle Policies — Automated Image Cleanup
 
@@ -512,15 +545,15 @@ Without lifecycle policies, repositories grow indefinitely. A busy CI pipeline p
 
 ### How Lifecycle Policies Work
 
-Lifecycle policies are evaluated once every 24 hours (not in real-time). Each policy contains rules with priorities, and rules are evaluated in priority order (lower number = evaluated first). A rule matches images by tag status and applies an action — either **expire** (delete) or **archive** (move to cheaper archive storage).
+Lifecycle policies are evaluated once every 24 hours (not in real-time). Each policy contains rules with priorities, and rules are evaluated in priority order (lower number = evaluated first). A rule matches images by tag status and applies an action — either **expire** (delete) or **transition** (move to archive storage class).
 
 Selection criteria include:
 
 - **`sinceImagePushed`** — match images older than N days since push
 - **`imageCountMoreThan`** — match when total image count exceeds N (keeps newest, expires oldest)
-- **`sinceImageLastPulled`** — match images not pulled in N days (usage-based, available with archive action)
+- **`sinceImagePulled`** — match images not pulled in N days (usage-based, available with the transition action)
 
-The CloudFormation template already set up a basic two-rule policy. Let's replace it with a more sophisticated version. This policy handles four scenarios: cleaning up untagged build artifacts, archiving stale images for compliance, retaining recent release images, and capping total images to prevent runaway growth:
+The CloudFormation template already set up a basic two-rule policy. Let's replace it with a more practical version that handles three scenarios: cleaning up untagged build artifacts quickly, capping the number of release images, and a safety net to prevent unbounded growth:
 
 ```bash
 # Apply a multi-rule lifecycle policy covering common production scenarios
@@ -541,18 +574,6 @@ aws ecr put-lifecycle-policy \
       },
       {
         "rulePriority": 2,
-        "description": "Archive images not pulled in 90 days (compliance retention)",
-        "selection": {
-          "tagStatus": "tagged",
-          "tagPatternList": ["v*"],
-          "countType": "sinceImageLastPulled",
-          "countUnit": "days",
-          "countNumber": 90
-        },
-        "action": { "type": "archive" }
-      },
-      {
-        "rulePriority": 3,
         "description": "Keep only last 30 release images",
         "selection": {
           "tagStatus": "tagged",
@@ -590,16 +611,57 @@ aws ecr start-lifecycle-policy-preview \
 aws ecr get-lifecycle-policy-preview \
   --repository-name ecr-deep-dive-app \
   --query 'previewResults[*].{Tag:imageTags[0],Rule:appliedRulePriority,Action:action.type}'
+
+# Once satisfied with the preview, apply the policy for real
+aws ecr put-lifecycle-policy \
+  --repository-name ecr-deep-dive-app \
+  --lifecycle-policy-text '{...}'  # same JSON as above
 ```
 
 ### Archive Storage Class
 
-The `archive` action in rule 2 above uses ECR's archive storage class — significantly cheaper storage for images you need to retain (compliance, audit trail) but rarely pull. Key constraints:
+For compliance-heavy environments where you need to retain images long-term but don't want to pay full storage costs, ECR offers an archive storage class. Instead of expiring images, you can transition them to cheaper archive storage using the `transition` action in lifecycle policies.
+
+```bash
+# Alternative: archive old images instead of deleting them
+# (use this instead of the count-based expire rule, not alongside it)
+aws ecr put-lifecycle-policy \
+  --repository-name ecr-deep-dive-app \
+  --lifecycle-policy-text '{
+    "rules": [
+      {
+        "rulePriority": 1,
+        "description": "Expire untagged images after 1 day",
+        "selection": {
+          "tagStatus": "untagged",
+          "countType": "sinceImagePushed",
+          "countUnit": "days",
+          "countNumber": 1
+        },
+        "action": { "type": "expire" }
+      },
+      {
+        "rulePriority": 2,
+        "description": "Archive release images not pulled in 90 days",
+        "selection": {
+          "tagStatus": "tagged",
+          "tagPatternList": ["v*"],
+          "countType": "sinceImagePulled",
+          "countUnit": "days",
+          "countNumber": 90
+        },
+        "action": { "type": "transition", "targetStorageClass": "archive" }
+      }
+    ]
+  }'
+```
+
+Key constraints:
 
 - Archived images have a **90-day minimum storage duration** — you can't archive and immediately delete
 - Archived images cannot be pulled directly — they must be restored to standard first
 - Restoration takes time (minutes, not instant)
-- Lifecycle policies can use `sinceImageLastPulled` as criteria specifically for the archive action — this lets you automatically archive images nobody is using
+- Lifecycle policies can use `sinceImagePulled` as criteria specifically for the transition action — this lets you automatically archive images nobody is using
 
 To manually archive or restore an image outside of lifecycle policies, use the `UpdateImageStorageClass` API:
 
@@ -608,13 +670,13 @@ To manually archive or restore an image outside of lifecycle policies, use the `
 aws ecr update-image-storage-class \
   --repository-name ecr-deep-dive-app \
   --image-id imageTag=v0.5.0 \
-  --image-storage-class ARCHIVE
+  --target-storage-class ARCHIVE
 
 # Restore an archived image back to standard storage
 aws ecr update-image-storage-class \
   --repository-name ecr-deep-dive-app \
   --image-id imageTag=v0.5.0 \
-  --image-storage-class STANDARD
+  --target-storage-class STANDARD
 ```
 
 ### Tag Pattern Matching
@@ -657,8 +719,10 @@ Enable immutability with exceptions for `latest` and any tag matching `dev-*`. T
 # Set immutable with exceptions for 'latest' and 'dev-*' tags
 aws ecr put-image-tag-mutability \
   --repository-name ecr-deep-dive-app \
-  --image-tag-mutability IMMUTABLE \
-  --image-tag-mutability-exceptions tagFilters='["latest","dev-*"]'
+  --image-tag-mutability IMMUTABLE_WITH_EXCLUSION \
+  --image-tag-mutability-exclusion-filters \
+    filterType=WILDCARD,filter=latest \
+    filterType=WILDCARD,filter="dev-*"
 ```
 
 ### When to Keep Mutability ON (Immutable = False)
@@ -748,26 +812,40 @@ How do you know the image you're pulling is the same one your pipeline built? Wi
 
 ECR managed signing is configured at the registry level. Once enabled, every image pushed to ECR is automatically signed using [AWS Signer](https://docs.aws.amazon.com/signer/latest/developerguide/Welcome.html) — no client-side tooling required. The signature is stored as an [OCI referrer artifact](https://github.com/opencontainers/image-spec/blob/main/manifest.md#guidelines-for-referrers) attached to the image (leveraging OCI Image Spec 1.1 support).
 
-Enable managed signing for your registry. This configures ECR to automatically generate a cryptographic signature via AWS Signer every time an image is pushed:
+Enable managed signing for your registry. This requires an [AWS Signer signing profile](https://docs.aws.amazon.com/signer/latest/developerguide/signing-profiles.html) — create one first, then configure ECR to use it for automatic signing:
 
 ```bash
-# Enable managed signing at the registry level
-# Every image pushed after this will be automatically signed
-aws ecr put-registry-configuration \
-  --managed-signing '{"status": "ENABLED"}'
+# Create a signing profile in AWS Signer (one-time setup)
+aws signer put-signing-profile \
+  --profile-name ecr_image_signing \
+  --platform-id Notation-OCI-SHA384-ECDSA
+
+# Configure ECR to auto-sign all pushed images using this profile
+aws ecr put-signing-configuration \
+  --signing-configuration '{
+    "rules": [
+      {
+        "signingProfileArn": "arn:aws:signer:<REGION>:<ACCOUNT_ID>:/signing-profiles/ecr_image_signing"
+      }
+    ]
+  }'
 ```
+
+The `rules` array supports repository filters if you only want to sign specific repos (e.g., `prod-*`). Without filters, all images pushed to any repository in the registry are signed.
+
+**Important:** Once signing is configured, any IAM principal pushing images must have `signer:SignPayload` permission on the signing profile. Our CloudFormation template already includes this permission on the CodeBuild role.
 
 After enabling, push a new image and verify the signature was created:
 
 ```bash
-# Push a new version (this will be auto-signed)
+# Push a new version (this will be auto-signed). 
+# Or trigger another CodeBuild job if you don't want to push the image yourself
 docker build -t <REPOSITORY_URI>:v2.0.0 .
 docker push <REPOSITORY_URI>:v2.0.0
 
-# List referrers (signatures) attached to the image
-aws ecr list-image-referrers \
-  --repository-name ecr-deep-dive-app \
-  --image-id imageTag=v2.0.0
+# Check the signing configuration is active
+aws ecr get-signing-configuration \
+  --query 'signingConfiguration.rules'
 ```
 
 ### Verifying Signatures at Deployment
@@ -775,12 +853,7 @@ aws ecr list-image-referrers \
 Signing is only useful if you verify. The typical verification points:
 
 - **EKS:** Use admission controllers like [Kyverno](https://kyverno.io/) or [OPA Gatekeeper](https://github.com/open-policy-agent/gatekeeper) to reject pods that reference unsigned images. Kyverno has native support for AWS Signer signature verification.
-- **General:** Use the [Notation CLI](https://notaryproject.dev/) with the AWS Signer plugin to verify signatures before deploying:
-
-```bash
-# Verify a signature using Notation (client-side verification)
-notation verify <REPOSITORY_URI>:v2.0.0
-```
+- **General:** Use the [Notation CLI](https://notaryproject.dev/) with the AWS Signer plugin to verify signatures locally. This requires client-side setup: a trust policy (`trustpolicy.json`) defining which signing identities you trust, and the [AWS Signer Notation plugin](https://docs.aws.amazon.com/signer/latest/developerguide/image-signing-prerequisites.html) installed. See the [AWS Signer image verification docs](https://docs.aws.amazon.com/signer/latest/developerguide/image-verification.html) for the full setup walkthrough.
 
 ### Managed vs. Manual Signing
 
@@ -868,6 +941,7 @@ After configuring replication, push a new image and verify it appears in the des
 
 ```bash
 # Push a new tagged image (triggers replication)
+# or trigger a new codebuild job
 docker tag <REPOSITORY_URI>:v1.0.0 <REPOSITORY_URI>:v1.0.1
 docker push <REPOSITORY_URI>:v1.0.1
 
@@ -928,11 +1002,13 @@ aws ecr put-registry-policy \
           "ecr:CreateRepository",
           "ecr:ReplicateImage"
         ],
-        "Resource": "arn:aws:ecr:us-east-1:<PROD_ACCOUNT_ID>:repository/*"
+        "Resource": "*"
       }
     ]
   }'
 ```
+
+Now push a new image tag and verify it exists on both AWS accounts
 
 ### Replication with KMS Encryption
 
@@ -995,6 +1071,12 @@ Remove everything in reverse order. Registry-level settings must be cleaned up b
 First, remove registry-level configurations. These were set up manually outside the CloudFormation stack:
 
 ```bash
+# Remove managed signing configuration
+aws ecr delete-signing-configuration
+
+# Delete the AWS Signer signing profile
+aws signer cancel-signing-profile --profile-name ecr_image_signing
+
 # Remove replication configuration (set to empty rules)
 aws ecr put-replication-configuration \
   --replication-configuration '{"rules": []}'
@@ -1003,6 +1085,16 @@ aws ecr put-replication-configuration \
 aws ecr put-replication-configuration \
   --replication-configuration '{"rules": []}' \
   --region eu-west-1
+
+# Delete the replicated repository in the destination region
+aws ecr delete-repository \
+  --repository-name ecr-deep-dive-app \
+  --region eu-west-1 \
+  --force 2>/dev/null
+
+# If cross-account replication was set up, delete the repo in the target account
+# (run this in the destination account)
+aws ecr delete-repository --repository-name ecr-deep-dive-app --force
 ```
 
 Remove pull-through cache rules and any auto-created repositories:
@@ -1014,25 +1106,6 @@ aws ecr delete-pull-through-cache-rule --ecr-repository-prefix docker-hub 2>/dev
 
 # Delete any auto-created pull-through cache repositories
 aws ecr delete-repository --repository-name ecr-public/nginx/nginx --force 2>/dev/null
-```
-
-Revert scanning to basic (or leave as-is if you want enhanced scanning on other repos):
-
-```bash
-# Revert to basic scanning
-aws ecr put-registry-scanning-configuration \
-  --scan-type BASIC \
-  --rules '[]'
-```
-
-Delete the replicated repository in the destination region (if it was auto-created by replication):
-
-```bash
-# Delete the replicated repo in eu-west-1
-aws ecr delete-repository \
-  --repository-name ecr-deep-dive-app \
-  --region eu-west-1 \
-  --force 2>/dev/null
 ```
 
 If you set up cross-account replication, remove the registry policy in the destination account:
@@ -1060,8 +1133,13 @@ BUCKET=$(aws cloudformation describe-stacks \
   --query 'Stacks[0].Outputs[?OutputKey==`BucketName`].OutputValue' \
   --output text)
 
-# Delete all objects in the bucket
-aws s3 rm s3://$BUCKET --recursive
+# Delete all object versions and delete markers (required for versioned buckets)
+aws s3api list-object-versions --bucket $BUCKET --output json \
+  | jq '{Objects: [.Versions[]?, .DeleteMarkers[]? | {Key, VersionId}]}' \
+  | aws s3api delete-objects --bucket $BUCKET --delete file:///dev/stdin
+
+# Delete all images from the ECR repository (CloudFormation can't delete non-empty repos)
+aws ecr delete-repository --repository-name ecr-deep-dive-app --force
 
 # Delete the CloudFormation stack (ECR repo, CodeBuild project, IAM role, S3 bucket)
 aws cloudformation delete-stack --stack-name ecr-deep-dive-lab
@@ -1079,3 +1157,5 @@ ECR is a full container lifecycle management platform — not just storage. The 
 **Operations:** lifecycle policies control storage costs automatically. Pull-through cache eliminates external registry dependencies. Replication distributes images globally with near-zero latency at pull time. These features require minimal setup but prevent real production incidents — registry outages, ballooning costs, slow deployments in distant regions.
 
 The key architectural insight: most ECR features are configured at the **registry level**, not per-repository. Scanning, replication, pull-through cache, and signing are all registry-wide settings. Only lifecycle policies and tag immutability are per-repository. This means you set them up once and every new repository benefits automatically.
+
+Interested on taking advantage of ECR features for your containerized application? [Let's talk!](mailto:hector@hectorzelaya.dev)

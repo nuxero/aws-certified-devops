@@ -1,0 +1,160 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Prerequisites for the ECR deep dive lab.
+  Creates an ECR repository, CodeBuild project, S3 bucket, and IAM roles.
+
+Resources:
+  # ECR repository with security best practices enabled by default
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: ecr-deep-dive-app
+      # Scan every image on push for OS-level vulnerabilities
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      # Prevent image tags from being overwritten — enforces build traceability
+      ImageTagMutability: IMMUTABLE
+      # Use AES256 encryption (free, simpler than KMS for learning)
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      # Basic lifecycle policy: expire untagged images after 7 days,
+      # keep only the last 20 tagged images
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 7 days",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 7
+                },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep only last 20 tagged images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["v"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 20
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # S3 bucket to store the Dockerfile and build context for CodeBuild
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'ecr-deep-dive-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+
+  # IAM role for CodeBuild — allows pushing images to ECR and writing logs
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ECRDeepDiveCodeBuildRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ECRDeepDivePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Allow CodeBuild to push and pull images from ECR
+              - Sid: ECRAccess
+                Effect: Allow
+                Action:
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImageScanFindings
+                  - ecr:StartImageScan
+                  - ecr:DescribeImages
+                  - ecr:ListImages
+                Resource: !GetAtt ECRRepository.Arn
+              # ECR login requires registry-level permission
+              - Sid: ECRAuth
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              # Allow writing build logs to CloudWatch
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/ecr-deep-dive-build'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/ecr-deep-dive-build:*'
+              # Allow reading build context from S3
+              - Sid: S3Access
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource:
+                  - !Sub 'arn:aws:s3:::ecr-deep-dive-${AWS::AccountId}/*'
+              # Allow signing images when managed signing is enabled
+              - Sid: SignerAccess
+                Effect: Allow
+                Action:
+                  - signer:SignPayload
+                Resource: '*'
+
+  # CodeBuild project that builds a Docker image and pushes it to ECR
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: ecr-deep-dive-build
+      Description: Builds and pushes a sample Docker image to ECR for scanning demos
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        # Privileged mode is required for Docker builds inside CodeBuild
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: REPOSITORY_URI
+            Value: !GetAtt ECRRepository.RepositoryUri
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+      Source:
+        Type: S3
+        Location: !Sub 'ecr-deep-dive-${AWS::AccountId}/build-context.zip'
+      TimeoutInMinutes: 15
+
+Outputs:
+  RepositoryUri:
+    Description: ECR repository URI for pushing images
+    Value: !GetAtt ECRRepository.RepositoryUri
+  RepositoryArn:
+    Description: ECR repository ARN
+    Value: !GetAtt ECRRepository.Arn
+  ProjectName:
+    Description: CodeBuild project name
+    Value: !Ref CodeBuildProject
+  BucketName:
+    Description: S3 bucket for build context
+    Value: !Ref ArtifactBucket

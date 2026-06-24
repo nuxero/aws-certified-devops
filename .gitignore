@@ -1,3 +1,4 @@
 .npm-global/
 .direnv/
 result
+node_modules

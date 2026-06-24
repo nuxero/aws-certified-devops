@@ -1,0 +1,57 @@
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      # Authenticate Docker to ECR so we can push images
+      - echo "Logging in to ECR..."
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $REPOSITORY_URI
+
+  build:
+    commands:
+      # Build the Docker image using the multi-stage Dockerfile
+      # Tag uses the build number — unique per build, works with immutable tags
+      - echo "Building image with tag v$CODEBUILD_BUILD_NUMBER..."
+      - docker build -t $REPOSITORY_URI:v$CODEBUILD_BUILD_NUMBER .
+
+  post_build:
+    commands:
+      # post_build always runs, even if build fails — guard against pushing a broken image
+      - |
+        if [ "$CODEBUILD_BUILD_SUCCEEDING" != "1" ]; then
+          echo "Build failed — skipping push"
+          exit 1
+        fi
+      # Push the tagged image to ECR — this triggers scan-on-push
+      - echo "Pushing image to ECR..."
+      - docker push $REPOSITORY_URI:v$CODEBUILD_BUILD_NUMBER
+      # Wait for the scan to complete, then check results
+      - echo "Waiting for scan to complete..."
+      - |
+        # Explicitly trigger a scan (in case scan-on-push has a registration delay)
+        aws ecr start-image-scan \
+          --repository-name ecr-deep-dive-app \
+          --image-id imageTag=v$CODEBUILD_BUILD_NUMBER || true
+
+        # Wait for the scan to finish — polls every 5s, up to 5 minutes
+        aws ecr wait image-scan-complete \
+          --repository-name ecr-deep-dive-app \
+          --image-id imageTag=v$CODEBUILD_BUILD_NUMBER
+
+        # Query the CRITICAL finding count
+        # --output text returns "None" when the key doesn't exist (no CRITICAL findings)
+        CRITICAL=$(aws ecr describe-image-scan-findings \
+          --repository-name ecr-deep-dive-app \
+          --image-id imageTag=v$CODEBUILD_BUILD_NUMBER \
+          --query 'imageScanFindings.findingSeverityCounts.CRITICAL' \
+          --output text)
+
+        if [ "$CRITICAL" = "None" ] || [ -z "$CRITICAL" ]; then
+          CRITICAL=0
+        fi
+
+        echo "Critical vulnerabilities found: $CRITICAL"
+        if [ "$CRITICAL" -gt 0 ]; then
+          echo "CRITICAL vulnerabilities detected — failing build"
+          exit 1
+        fi
