@@ -39,7 +39,7 @@
           ];
 
           shellHook = ''
-            export AWS_PROFILE=hector-experiments
+            export AWS_PROFILE=zyc
             export AWS_DEFAULT_OUTPUT=json
 
             # Install AWS CDK globally via npm if not present

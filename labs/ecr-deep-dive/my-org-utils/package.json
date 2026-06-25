@@ -1,0 +1,6 @@
+{
+  "name": "@my-org/utils",
+  "version": "1.0.0",
+  "description": "Internal shared utilities",
+  "main": "index.js"
+}

@@ -59,7 +59,7 @@ Note the `arn` in the output — you'll need it later for cross-account policies
 
 ### Create an Upstream Repository with an External Connection
 
-The recommended pattern is one dedicated upstream repository per public registry. This upstream repository holds the external connection (the proxy link to the public internet) and acts as the shared cache layer. First, create the repository, then attach the external connection that links it to npmjs.com:
+The recommended pattern is **one dedicated upstream repository per public registry**. This upstream repository holds the external connection (the proxy link to the public internet) and acts as the shared cache layer. First, create the repository, then attach the external connection that links it to npmjs.com:
 
 ```bash
 # Create a repository that will serve as the upstream (proxy) for npmjs.com
@@ -111,22 +111,35 @@ aws codeartifact login \
 
 This does two things: sets the `registry` in your `.npmrc` to the CodeArtifact endpoint, and writes an auth token. The token expires after 12 hours by default (the maximum). After expiration, you'll need to run `login` again.
 
-Now install a package to verify the setup works and observe the caching behavior:
+Now install a package to verify the setup works and observe the caching behavior. If you've previously installed packages from the public registry, clear your local npm cache first — otherwise npm may serve the package from its local cache without ever contacting CodeArtifact:
 
 ```bash
+# Clear npm cache to ensure packages are fetched from CodeArtifact, not local cache
+npm cache clean --force
+
 # Install a package — this will be fetched from npmjs.com via the upstream chain
 npm install lodash
 ```
 
-Verify that the package was cached in CodeArtifact. This command lists all packages that have been resolved into your repository — you should see `lodash` after the install:
+Verify that the package was cached in CodeArtifact. Use `list-package-versions` with the specific package name and format — this checks whether the package was retained in the downstream repository after resolution:
 
 ```bash
-# List cached packages in the team repository
-aws codeartifact list-packages \
+# Verify lodash was retained in the team repository after install
+aws codeartifact list-package-versions \
   --domain my-org \
   --repository my-team \
-  --query 'packages[*].{Name:package,Format:format}'
+  --format npm \
+  --package lodash
+
+# You can also check the upstream (where all externally-fetched packages are stored)
+aws codeartifact list-package-versions \
+  --domain my-org \
+  --repository npm-store \
+  --format npm \
+  --package lodash
 ```
+
+You can also confirm your npm client is using CodeArtifact by checking `package-lock.json` — the `resolved` URLs should point to your CodeArtifact domain instead of `registry.npmjs.org`.
 
 From now on, any subsequent `npm install lodash` — by you or anyone else pointed at this repository — is served directly from CodeArtifact without touching npmjs.com.
 
@@ -188,13 +201,6 @@ aws codeartifact list-package-versions \
 
 Now any team member can `npm install @my-org/utils` — internal and external packages come from the same registry, with a single authentication mechanism.
 
-Return to the parent directory before continuing:
-
-```bash
-# Move back to the working directory for the remaining steps
-cd ..
-```
-
 ## Package Origin Controls — Preventing Dependency Confusion
 
 Here's a real attack scenario: an attacker notices your internal packages use the namespace `@my-org`. They publish a package called `@my-org/utils` to the *public* npm registry with version `99.0.0`. Without protection, your builds might resolve the attacker's version (higher semver wins in some resolution strategies) instead of your internal `1.0.0`.
@@ -229,15 +235,14 @@ Setting origin controls package-by-package doesn't scale. Package groups let you
 # Create a package group that protects all @my-org scoped packages
 aws codeartifact create-package-group \
   --domain my-org \
-  --format npm \
-  --package-group "npm/@my-org/*" \
+  --package-group "/npm/@my-org/*" \
   --description "Internal packages — block upstream ingestion"
 
-# Set origin controls on the group
+# Set origin controls on the group: allow publishing, block external upstream ingestion
 aws codeartifact update-package-group-origin-configuration \
   --domain my-org \
-  --package-group "npm/@my-org/*" \
-  --restrictions "{\"publish\":{\"restrictionMode\":\"ALLOW\"},\"externalUpstream\":{\"restrictionMode\":\"BLOCK\"}}"
+  --package-group "/npm/@my-org/*" \
+  --restrictions '{"PUBLISH":"ALLOW","EXTERNAL_UPSTREAM":"BLOCK"}'
 ```
 
 Now any new package published under `@my-org/` automatically inherits the BLOCK upstream rule. No one can inject a malicious version from the public registry, regardless of version numbers.
@@ -319,22 +324,20 @@ phases:
   install:
     runtime-versions:
       nodejs: 18
+
+  pre_build:
     commands:
       # Authenticate npm to CodeArtifact before any package installation
       - echo "=== Configuring CodeArtifact ==="
       - aws codeartifact login --tool npm --domain my-org --repository my-team
-      - echo "npm registry set to CodeArtifact"
-
-  pre_build:
-    commands:
       # Dependencies are resolved from CodeArtifact (cached or fetched from upstream)
       - echo "=== Installing dependencies ==="
       - npm ci
-      - echo "=== Running tests ==="
-      - npm test
 
   build:
     commands:
+      - echo "=== Running tests ==="
+      - npm test
       - echo "=== Building application ==="
       - npm run build
 ```
