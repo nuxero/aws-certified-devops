@@ -1,0 +1,101 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Prerequisites for CodeDeploy Lambda deployment lab.
+  Creates a Lambda function with alias, CodeDeploy application and deployment group.
+
+Resources:
+  # Execution role for the Lambda function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CodeDeployLambdaExecRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # IAM role for the CodeDeploy service to manage Lambda deployments
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CodeDeployLambdaServiceRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRoleForLambda
+
+  # The Lambda function — version 1
+  AppFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: codedeploy-lab-function
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            return {
+              statusCode: 200,
+              body: JSON.stringify({ version: "1.0", message: "Hello from v1" })
+            };
+          };
+
+  # Publish version 1 — Lambda versions are immutable snapshots of the function code
+  FunctionVersionV1:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref AppFunction
+      Description: Version 1
+
+  # The alias is the stable endpoint consumers invoke.
+  # CodeDeploy controls which version the alias points to.
+  FunctionAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref AppFunction
+      FunctionVersion: !GetAtt FunctionVersionV1.Version
+      Name: live
+
+  # CodeDeploy application for the Lambda compute platform
+  CodeDeployApp:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: codedeploy-lab-lambda
+      ComputePlatform: Lambda
+
+  # Deployment group using AllAtOnce — shifts all traffic immediately
+  DeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApp
+      DeploymentGroupName: lambda-dev-group
+      DeploymentConfigName: CodeDeployDefault.LambdaAllAtOnce
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      DeploymentStyle:
+        DeploymentType: BLUE_GREEN
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+
+Outputs:
+  FunctionName:
+    Description: Lambda function name
+    Value: !Ref AppFunction
+  AliasArn:
+    Description: Lambda alias ARN (the stable invocation endpoint)
+    Value: !Ref FunctionAlias
+  CurrentVersion:
+    Description: Currently deployed version number
+    Value: !GetAtt FunctionVersionV1.Version
+  DeploymentGroupName:
+    Description: CodeDeploy deployment group name
+    Value: !Ref DeploymentGroup

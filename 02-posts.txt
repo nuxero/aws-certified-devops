@@ -10,10 +10,14 @@ post #3: Understanding CodeArtifact
 
 Defining what the CodeArtifact service allows and understanding it's features. A step by step guide of a basic, standard workflow
 
-post #4: Deploy Anywhere with CodeDeploy
+post #4: CodeDeploy on EC2: From First Deployment to Blue/Green
 
-Explain what CodeDeploy is and its capabilities. Show a step by step guide to deploy a basic web application to an EC2 instance, ECS Fargate and Lambda
+Explain what CodeDeploy is and its mechanics. Step by step guide deploying to EC2 using all strategies: AllAtOnce, HalfAtATime, OneAtATime, and Blue/Green with ASG. Covers lifecycle hooks, AppSpec, automatic rollback with CloudWatch alarms.
 
-post #5: CodeDeploy Deployment Strategies
+post #5: Deploying Lambda Functions Safely: SAM, CodeDeploy, Canary Strategies, and Automatic Rollback
 
-List and explain the multiple deployment strategies supported by CodeDeploy: All-at-Once, Canary, Rolling, Immutable and Blue/Green
+Lambda versions/aliases, CodeDeploy canary/linear with pre-traffic hooks, SAM DeploymentPreference (the real-world workflow), CodePipeline V2 Lambda action. Shows raw mechanics then the automated approach.
+
+post #6: ECS Deployment Strategies: CodeDeploy Blue/Green vs. Native Canary and Linear
+
+CodeDeploy blue/green with test listener and AfterAllowTestTraffic hook, ECS-native blue/green/canary/linear, comparison and decision framework for choosing between them.
