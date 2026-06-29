@@ -21,6 +21,7 @@ ECS has two deployment paths: CodeDeploy-managed (the original approach for blue
 ## Self-Contained Post Requirements
 
 - All code inline (CloudFormation templates, AppSpec files, hook functions, CLI commands)
+- Each code snippet should be preceeded by a paragraph briefly describing what the code does, and inline comments referencing the explanation
 - Mermaid diagrams for blue/green task set switching and traffic flow
 - Two CloudFormation templates: one for CodeDeploy approach, one for ECS-native approach
 - Side-by-side comparison of the same deployment scenario using both methods
@@ -31,7 +32,7 @@ ECS has two deployment paths: CodeDeploy-managed (the original approach for blue
 
 ### 1. Introduction — The ECS Deployment Landscape
 
-- ECS rolling update: the default. Updates tasks in place. Simple but limited (no instant rollback, no pre-validation).
+- ECS rolling update: the default. Replaces old tasks with new ones gradually — new tasks must pass health checks before old ones are stopped. Simple but limited (no instant rollback via ALB switch, no test listener for pre-validation).
 - CodeDeploy blue/green: the original advanced option. Full lifecycle hooks, test listeners, alarm-based rollback. More complex to set up.
 - ECS-native blue/green/canary/linear: the newer option. Simpler configuration, tighter ECS integration, fewer moving parts. Covers most use cases.
 - This post teaches both CodeDeploy and native approaches, then helps you choose.
@@ -52,7 +53,7 @@ ECS has two deployment paths: CodeDeploy-managed (the original approach for blue
 - Template provisions:
   - ECS cluster (Fargate)
   - ECS service with `DeploymentController: CODE_DEPLOY`
-  - Task definition (nginx or Node.js, v1 image)
+  - Task definition (nginx or Node.js from AWS PUblic Gallery, v1 image)
   - ALB with two target groups + production listener (80) + test listener (8080)
   - ECR repository with v1 image pre-pushed
   - CodeDeploy application (compute platform: ECS) + deployment group
@@ -107,10 +108,11 @@ ECS has two deployment paths: CodeDeploy-managed (the original approach for blue
 
 - Deployment controller: `ECS` (not `CODE_DEPLOY`)
 - Configuration: done entirely via ECS service deployment config (no separate CodeDeploy application/group/AppSpec)
-- Lifecycle hooks: uses ECS service deployment lifecycle (not CodeDeploy hooks) — alarms attached directly to ECS
+- Lifecycle hooks: ECS-native Lambda hooks and pause hooks — similar capability to CodeDeploy but with different stage names (`PRE_SCALE_UP`, `POST_SCALE_UP`, `TEST_TRAFFIC_SHIFT`, `POST_TEST_TRAFFIC_SHIFT`, `PRE_PRODUCTION_TRAFFIC_SHIFT`, `POST_PRODUCTION_TRAFFIC_SHIFT`)
 - No AppSpec file needed
 - Test listener support: yes, built into the ECS service configuration
-- Trade-off: simpler setup, but no Lambda-based lifecycle hooks (can't run arbitrary validation code at each stage)
+- Two hook types: Lambda hooks (ECS invokes your function, expects `hookStatus` response) and Pause hooks (deployment pauses until you call `ContinueServiceDeployment` API)
+- Trade-off: simpler setup (no CodeDeploy app/group/role), same validation capabilities, tighter ECS integration
 
 #### 4.2 Prerequisites — CloudFormation Template (Native)
 
@@ -136,40 +138,31 @@ ECS has two deployment paths: CodeDeploy-managed (the original approach for blue
 - Linear: equal increments with bake time between each
 - Alarm-based rollback: CloudWatch alarms attached at the ECS service level
 
-### 5. Approach 3 — ECS Rolling Update (Brief)
-
-- The simplest option: `DeploymentController: ECS` with `minimumHealthyPercent` and `maximumPercent`
-- ECS drains old tasks and launches new ones in batches
-- No blue/green, no instant rollback, no test listener
-- When to use: development environments, services where brief mixed-version traffic is acceptable
-- Not suitable for zero-downtime production deployments
-
-### 6. Comparison: Choosing Between Approaches
+### 5. Comparison: Choosing Between Approaches
 
 | Aspect | CodeDeploy Blue/Green | ECS Native Blue/Green | ECS Rolling Update |
 |--------|----------------------|----------------------|-------------------|
 | Setup complexity | High (CodeDeploy app, group, role, AppSpec, hooks) | Medium (ECS service config) | Low (just min/max percent) |
-| Lifecycle hooks | Yes — Lambda functions at 5 stages | No (alarm-based only) | No |
+| Lifecycle hooks | Yes — Lambda functions at 5 CodeDeploy stages | Yes — Lambda hooks + pause hooks at 8 ECS stages | No |
 | Test listener | Yes | Yes | No |
-| Custom validation code | Yes (AfterAllowTestTraffic) | No (health checks + alarms only) | No |
+| Custom validation code | Yes (AfterAllowTestTraffic) | Yes (POST_TEST_TRAFFIC_SHIFT Lambda hook) | No |
 | Traffic strategies | AllAtOnce, Canary, Linear | AllAtOnce, Canary, Linear | Rolling (min healthy %) |
-| Rollback speed | Instant (ALB switch) | Instant (ALB switch) | Slow (new tasks must start) |
+| Rollback speed | Instant (ALB switch) | Instant (ALB switch) | Slow (must launch old task def tasks again) |
 | CodePipeline integration | CodeDeploy deploy action | ECS deploy action | ECS deploy action |
 | When to use | Complex validation, existing CodeDeploy pipelines | Most new production deployments | Dev/test, simple services |
 
 Decision framework:
-- Need Lambda-based custom validation before production traffic? → CodeDeploy
 - Already have CodeDeploy pipelines and want to keep consistency? → CodeDeploy
-- New deployment, want simplicity with blue/green safety? → ECS Native
+- New deployment, want lifecycle hooks with less configuration? → ECS Native
 - Dev environment, minimal config? → Rolling Update
 
-### 7. Clean Up
+### 6. Clean Up
 
+- Check for orphaned task definitions and target groups
 - Delete CloudFormation stacks (both approaches)
 - Delete ECR images
-- Check for orphaned task definitions and target groups
 
-### 8. Conclusion
+### 7. Conclusion
 
 - ECS has three deployment options: rolling update, CodeDeploy blue/green, ECS-native blue/green/canary/linear
 - CodeDeploy adds Lambda lifecycle hooks (especially `AfterAllowTestTraffic`) for complex validation scenarios
