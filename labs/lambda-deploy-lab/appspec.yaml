@@ -1,0 +1,12 @@
+version: 0.0
+Resources:
+  - deploy-lab-function:
+      Type: AWS::Lambda::Function
+      Properties:
+        Name: deploy-lab-function    # The function to deploy
+        Alias: live                  # The alias CodeDeploy will shift traffic on
+        CurrentVersion: 2            # Where traffic is now
+        TargetVersion: 3            # Where traffic should go
+Hooks:
+  # Reference a Lambda function by name — CodeDeploy invokes it before traffic shifts
+  - BeforeAllowTraffic: CodeDeployHook_deploy-lab-pretraffic

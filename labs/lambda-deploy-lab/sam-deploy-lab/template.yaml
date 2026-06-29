@@ -1,0 +1,63 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Lambda safe deployment with SAM DeploymentPreference
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Timeout: 10
+
+Resources:
+  # Main function — AutoPublishAlias creates/updates the "live" alias on each deploy
+  MyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: sam-deploy-lab-function
+      Handler: src/app.handler
+      AutoPublishAlias: live  # SAM auto-publishes a new version and updates this alias
+      DeploymentPreference:
+        Type: Canary10Percent5Minutes  # 10% traffic for 5 min, then 100%
+        Alarms:
+          - !Ref FunctionErrorsAlarm  # Rollback if this alarm fires during deployment
+        Hooks:
+          PreTraffic: !Ref PreTrafficHook  # Validate before any traffic shifts
+
+  # Hook function — must start with "CodeDeployHook_" for SAM's auto-generated IAM to work
+  PreTrafficHook:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: CodeDeployHook_sam-deploy-lab-pretraffic
+      Handler: src/pretraffic.handler
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - codedeploy:PutLifecycleEventHookExecutionStatus
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !Sub '${MyFunction.Arn}:*'
+      Environment:
+        Variables:
+          TARGET_FUNCTION: !Ref MyFunction  # Resolves to the function name
+          TARGET_ALIAS: live
+
+  # Alarm — triggers automatic rollback if errors occur during canary
+  FunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: sam-deploy-lab-errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref MyFunction
+        - Name: Resource
+          Value: !Sub '${MyFunction}:live'  # Scoped to the alias, not $LATEST
