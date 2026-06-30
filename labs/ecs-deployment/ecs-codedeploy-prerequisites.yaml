@@ -1,0 +1,308 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  ECS CodeDeploy blue/green lab. Creates Fargate service with ALB,
+  two target groups, test listener, CodeDeploy application and deployment group.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two public subnets
+
+Resources:
+  # ECS Cluster
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: ecs-deploy-lab
+
+  # Task execution role — allows ECS to pull images and write logs
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ecs-deploy-lab-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # Security groups
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - allow HTTP on port 80 and 8080
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS tasks - allow HTTP from ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+
+  # Application Load Balancer
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: ecs-deploy-lab-alb
+      Subnets: !Ref SubnetIds
+      SecurityGroups: [!Ref ALBSecurityGroup]
+
+  # Two target groups — blue (initial) and green (replacement during deployment)
+  BlueTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: ecs-deploy-lab-blue
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckPath: /
+
+  GreenTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: ecs-deploy-lab-green
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckPath: /
+
+  # Production listener — port 80, routes to blue target group
+  ProductionListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref BlueTargetGroup
+
+  # Test listener — port 8080, routes to green target group during deployment
+  TestListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 8080
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref BlueTargetGroup
+
+  # Task definition — nginx serving a simple page (v1)
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: ecs-deploy-lab
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          # Using the public nginx image from Amazon ECR Public Gallery
+          Image: public.ecr.aws/nginx/nginx:1.27
+          PortMappings:
+            - ContainerPort: 80
+          Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/deploy-lab
+      RetentionInDays: 7
+
+  # ECS Service — deployment controller set to CODE_DEPLOY
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: ProductionListener
+    Properties:
+      ServiceName: deploy-lab-service
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 2
+      LaunchType: FARGATE
+      # CODE_DEPLOY deployment controller — CodeDeploy manages blue/green
+      DeploymentController:
+        Type: CODE_DEPLOY
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref TaskSecurityGroup]
+      LoadBalancers:
+        - ContainerName: app
+          ContainerPort: 80
+          TargetGroupArn: !Ref BlueTargetGroup
+
+  # CodeDeploy service role — allows CodeDeploy to manipulate ECS services and ALB
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ecs-deploy-lab-codedeploy-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS
+
+  # CodeDeploy application — compute platform ECS
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: ecs-deploy-lab
+      ComputePlatform: ECS
+
+  # CodeDeploy deployment group — wires together service, target groups, listeners
+  DeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentGroupName: ecs-deploy-lab-dg
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      DeploymentConfigName: CodeDeployDefault.ECSAllAtOnce
+      # Blue/green deployment style
+      DeploymentStyle:
+        DeploymentType: BLUE_GREEN
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+      # Wire up ECS service + target groups + listeners
+      ECSServices:
+        - ClusterName: !Ref Cluster
+          ServiceName: !GetAtt Service.Name
+      LoadBalancerInfo:
+        TargetGroupPairInfoList:
+          - TargetGroups:
+              - Name: ecs-deploy-lab-blue
+              - Name: ecs-deploy-lab-green
+            ProdTrafficRoute:
+              ListenerArns:
+                - !Ref ProductionListener
+            TestTrafficRoute:
+              ListenerArns:
+                - !Ref TestListener
+      # Keep blue task set alive for 5 minutes after traffic shifts (rollback window)
+      BlueGreenDeploymentConfiguration:
+        TerminateBlueInstancesOnDeploymentSuccess:
+          Action: TERMINATE
+          TerminationWaitTimeInMinutes: 5
+        DeploymentReadyOption:
+          ActionOnTimeout: CONTINUE_DEPLOYMENT
+          WaitTimeInMinutes: 0
+
+  # Lambda hook function role
+  HookFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ecs-deploy-lab-hook-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CodeDeployHookPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: codedeploy:PutLifecycleEventHookExecutionStatus
+                Resource: '*'
+
+  # AfterAllowTestTraffic hook — validates the green task set via test listener
+  TestTrafficHook:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CodeDeployHook_ecs-deploy-lab-test-traffic
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt HookFunctionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          TEST_URL: !Sub 'http://${ALB.DNSName}:8080'
+      Code:
+        ZipFile: |
+          const { CodeDeployClient, PutLifecycleEventHookExecutionStatusCommand } = require("@aws-sdk/client-codedeploy");
+          const codedeploy = new CodeDeployClient();
+
+          exports.handler = async (event) => {
+            const deploymentId = event.DeploymentId;
+            const lifecycleEventHookExecutionId = event.LifecycleEventHookExecutionId;
+            let status = "Failed";
+
+            try {
+              // Hit the test listener to validate the green task set
+              const response = await fetch(process.env.TEST_URL);
+              if (response.ok) {
+                console.log("Test traffic validation passed — HTTP", response.status);
+                status = "Succeeded";
+              } else {
+                console.error("Test traffic validation failed — HTTP", response.status);
+              }
+            } catch (err) {
+              console.error("Test traffic validation error:", err);
+            }
+
+            // Report result to CodeDeploy
+            await codedeploy.send(new PutLifecycleEventHookExecutionStatusCommand({
+              deploymentId,
+              lifecycleEventHookExecutionId,
+              status,
+            }));
+
+            return { statusCode: 200, body: status };
+          };
+
+Outputs:
+  ALBDns:
+    Description: ALB DNS — use to verify deployments
+    Value: !GetAtt ALB.DNSName
+  TestListenerUrl:
+    Description: Test listener URL (port 8080)
+    Value: !Sub 'http://${ALB.DNSName}:8080'
+  ClusterName:
+    Value: !Ref Cluster
+  ServiceName:
+    Value: !GetAtt Service.Name
+  TaskDefinitionArn:
+    Value: !Ref TaskDefinition
+  CodeDeployApp:
+    Value: !Ref CodeDeployApplication
+  DeploymentGroup:
+    Value: !Ref DeploymentGroup

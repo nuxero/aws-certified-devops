@@ -1,6 +1,10 @@
 # ECS Deployment Strategies: CodeDeploy Blue/Green vs. Native Canary and Linear
 
-ECS offers three deployment strategies. The **rolling update** is the default — ECS launches new tasks, waits for health checks, then drains old ones. Simple, but it provides no instant rollback and no test traffic validation. **CodeDeploy blue/green** is the original advanced option — full lifecycle hooks, a test listener for pre-production validation, and alarm-based rollback. It works, but requires setting up a separate CodeDeploy application, deployment group, AppSpec file, and service role. **ECS-native blue/green** (July 2025) provides the same capabilities — Lambda lifecycle hooks, test listeners, canary/linear traffic shifting — with significantly less configuration and tighter ECS integration.
+ECS offers three deployment strategies. 
+
+* The **rolling update** is the default — ECS launches new tasks, waits for health checks, then drains old ones. Simple, but it provides no instant rollback and no test traffic validation. 
+* **CodeDeploy blue/green** is the original advanced option — full lifecycle hooks, a test listener for pre-production validation, and alarm-based rollback. It works, but requires setting up a separate CodeDeploy application, deployment group, AppSpec file, and service role. 
+* **ECS-native blue/green** provides the same capabilities — Lambda lifecycle hooks, test listeners, canary/linear traffic shifting — with significantly less configuration and tighter ECS integration.
 
 This post deploys the same application using both CodeDeploy and ECS-native approaches, compares the mechanics, and provides a decision framework for choosing between them.
 
@@ -11,11 +15,16 @@ To follow along, you'll need:
 - [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) configured with credentials that have permissions for ECS, EC2, ELB, IAM, CodeDeploy, CloudWatch, and Lambda
 - An AWS account — estimated cost is ~$1–2 USD (Fargate tasks running for a few hours, ALB)
 - A VPC with at least two public subnets in different Availability Zones (the default VPC works)
-- Docker installed locally (for building container images)
 
 ## ECS Deployment Concepts
 
 Before diving into strategies, a few concepts that both approaches share:
+
+**Task definition** is a blueprint for your application. It specifies the container image, CPU/memory, port mappings, environment variables, and logging configuration. Each change to a task definition creates a new numbered *revision* (e.g., `my-app:1`, `my-app:2`). Deploying = pointing a service at a new revision.
+
+**Service** maintains a desired number of running tasks from a task definition. It handles scheduling, health checks, and integration with load balancers. The service's deployment controller determines how updates roll out.
+
+**Deployment controller** determines who manages deployments: `ECS` (rolling update or native blue/green/canary/linear), `CODE_DEPLOY` (CodeDeploy-managed), or `EXTERNAL`.
 
 **Task sets** are groups of tasks within a service. Blue/green deployments maintain two task sets simultaneously — the blue (current) set serving production traffic, and the green (replacement) set being validated.
 
@@ -25,7 +34,7 @@ Before diving into strategies, a few concepts that both approaches share:
 
 **Test listener** routes to the replacement task set on a separate port (e.g., 8080). This allows you to validate the new version before any real users see it.
 
-**Deployment controller** determines who manages deployments: `ECS` (rolling update or native blue/green/canary/linear), `CODE_DEPLOY` (CodeDeploy-managed), or `EXTERNAL`.
+**Fargate** is the serverless compute engine for ECS. You define CPU and memory in the task definition; AWS manages the underlying infrastructure. All examples in this post use Fargate.
 
 ```mermaid
 flowchart LR
@@ -50,7 +59,7 @@ During deployment, the test listener routes to the green task set. After validat
 
 ### Prerequisites — CloudFormation Template
 
-This template provisions the full infrastructure: an ECS Fargate service running nginx, an ALB with two target groups and two listeners (production on port 80, test on port 8080), and all CodeDeploy resources including a lifecycle hook Lambda function.
+This template provisions the full infrastructure: an ECS Fargate service running a simple web application that returns "Hello World v1", an ALB with two target groups and two listeners (production on port 80, test on port 8080), and all CodeDeploy resources including a lifecycle hook Lambda function.
 
 **`ecs-codedeploy-prerequisites.yaml`**:
 
@@ -167,7 +176,7 @@ Resources:
         - Type: forward
           TargetGroupArn: !Ref BlueTargetGroup
 
-  # Task definition — nginx serving a simple page (v1)
+  # Task definition — simple Node.js HTTP server returning "Hello World v1"
   TaskDefinition:
     Type: AWS::ECS::TaskDefinition
     Properties:
@@ -179,8 +188,21 @@ Resources:
       ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
       ContainerDefinitions:
         - Name: app
-          # Using the public nginx image from Amazon ECR Public Gallery
-          Image: public.ecr.aws/nginx/nginx:1.27
+          Image: public.ecr.aws/docker/library/node:20-alpine
+          # Inline HTTP server — returns the version from APP_VERSION env var
+          Command:
+            - node
+            - -e
+            - |
+              const http = require('http');
+              const version = process.env.APP_VERSION || '1';
+              http.createServer((req, res) => {
+                res.writeHead(200, {'Content-Type': 'text/plain'});
+                res.end(`Hello World v${version}\n`);
+              }).listen(80);
+          Environment:
+            - Name: APP_VERSION
+              Value: '1'
           PortMappings:
             - ContainerPort: 80
           Essential: true
@@ -385,21 +407,81 @@ ALB_DNS=$(aws cloudformation describe-stacks --stack-name ecs-codedeploy-lab \
 
 # Verify v1 is serving traffic
 curl http://$ALB_DNS
+# Expected: Hello World v1
+```
+
+### Deploy v2 with CodeDeploy
+
+To trigger a blue/green deployment, register a new task definition revision and create a CodeDeploy deployment referencing it. The new task definition changes `APP_VERSION` from `1` to `2`. This makes the application respond with "Hello World v2":
+
+> **Note:** In a real project, deploying a new version means building a Docker image, pushing it to Docker registry (i.e. ECR, DockerHub, etc), and updating the `image` field in the task definition. This lab uses an inline `node -e` command with an environment variable to simulate version changes without requiring a Docker build workflow — keeping the focus on deployment mechanics.
+
+**`task-definition-v2.json`**:
+
+```json
+{
+  "family": "ecs-deploy-lab",
+  "cpu": "256",
+  "memory": "512",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "executionRoleArn": "<EXECUTION_ROLE_ARN>",
+  "containerDefinitions": [
+    {
+      "name": "app",
+      "image": "public.ecr.aws/docker/library/node:20-alpine",
+      "command": [
+        "node", "-e",
+        "const http = require('http'); const version = process.env.APP_VERSION || '1'; http.createServer((req, res) => { res.writeHead(200, {'Content-Type': 'text/plain'}); res.end(`Hello World v${version}\\n`); }).listen(80);"
+      ],
+      "environment": [
+        { "name": "APP_VERSION", "value": "2" }
+      ],
+      "portMappings": [{ "containerPort": 80 }],
+      "essential": true,
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/deploy-lab",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}
+```
+
+Fill in the execution role ARN and register it:
+
+```bash
+# Inject the execution role ARN into the JSON file
+EXEC_ROLE=$(aws iam get-role --role-name ecs-deploy-lab-execution-role \
+  --query 'Role.Arn' --output text)
+
+sed -i "s|<EXECUTION_ROLE_ARN>|$EXEC_ROLE|" task-definition-v2.json
+
+# Register the new task definition revision
+NEW_TASK_DEF=$(aws ecs register-task-definition \
+  --cli-input-json file://task-definition-v2.json \
+  --query 'taskDefinition.taskDefinitionArn' --output text)
+
+echo "New task definition: $NEW_TASK_DEF"
 ```
 
 ### The AppSpec File for ECS
 
-The ECS AppSpec declares which task definition to deploy and how to wire it to the load balancer. The `Hooks` section references Lambda functions to run at each lifecycle stage.
+The ECS AppSpec declares which task definition to deploy and how to wire it to the load balancer. The `Hooks` section references Lambda functions to run at each lifecycle stage. Here's the structure:
 
 ```yaml
-# appspec.yaml
+# AppSpec structure for ECS CodeDeploy deployments
 version: 0.0
 Resources:
   - TargetService:
       Type: AWS::ECS::Service
       Properties:
-        # New task definition ARN (updated for each deployment)
-        TaskDefinition: "arn:aws:ecs:us-east-1:111222333444:task-definition/ecs-deploy-lab:2"
+        # The new task definition ARN to deploy
+        TaskDefinition: "arn:aws:ecs:us-east-1:123456789:task-definition/ecs-deploy-lab:2"
         LoadBalancerInfo:
           ContainerName: "app"       # Must match container name in task definition
           ContainerPort: 80          # Must match container port mapping
@@ -418,69 +500,16 @@ The available lifecycle hooks for ECS CodeDeploy deployments, in execution order
 
 `AfterAllowTestTraffic` is the most important hook — it's your chance to validate the new version using real infrastructure (ALB, networking, container config) without affecting production users.
 
-### The AfterAllowTestTraffic Hook Function
+Now create the deployment, passing the AppSpec inline with the `$NEW_TASK_DEF` variable from the previous step:
 
-The hook function (already included in the CloudFormation template above) hits the test listener URL, checks for an HTTP 200 response, and reports the result to CodeDeploy. If it reports `Failed`, production traffic stays on blue and the green task set is terminated.
-
-The hook receives a `DeploymentId` and `LifecycleEventHookExecutionId` from CodeDeploy and must call `PutLifecycleEventHookExecutionStatus` to report `Succeeded` or `Failed`. If the hook doesn't report back within its timeout, CodeDeploy treats it as a failure.
-
-### Deploy v2 with CodeDeploy
-
-To trigger a blue/green deployment, register a new task definition revision and create a CodeDeploy deployment referencing it.
-
-First, register a new task definition that uses a different image (simulating a code change). For this lab, we'll switch from nginx 1.27 to nginx 1.27-alpine:
+> **Note:** In a real project, you'd store the AppSpec in S3 and reference it with `--s3-location bucket=...,key=appspec.yaml,bundleType=YAML`. We're passing it inline here to keep the lab self-contained.
 
 ```bash
-# Get the current task definition and update the image
-TASK_DEF_ARN=$(aws cloudformation describe-stacks --stack-name ecs-codedeploy-lab \
-  --query 'Stacks[0].Outputs[?OutputKey==`TaskDefinitionArn`].OutputValue' --output text)
-
-# Register a new revision with the updated image
-aws ecs describe-task-definition --task-definition ecs-deploy-lab \
-  --query 'taskDefinition.{containerDefinitions:containerDefinitions,family:family,cpu:cpu,memory:memory,networkMode:networkMode,requiresCompatibilities:requiresCompatibilities,executionRoleArn:executionRoleArn}' \
-  --output json | \
-  jq '.containerDefinitions[0].image = "public.ecr.aws/nginx/nginx:1.27-alpine"' | \
-  xargs -0 -I {} aws ecs register-task-definition --cli-input-json '{}'
-
-# Alternatively, register directly:
-NEW_TASK_DEF=$(aws ecs register-task-definition \
-  --family ecs-deploy-lab \
-  --cpu '256' --memory '512' \
-  --network-mode awsvpc \
-  --requires-compatibilities FARGATE \
-  --execution-role-arn $(aws iam get-role --role-name ecs-deploy-lab-execution-role --query 'Role.Arn' --output text) \
-  --container-definitions '[{
-    "name": "app",
-    "image": "public.ecr.aws/nginx/nginx:1.27-alpine",
-    "portMappings": [{"containerPort": 80}],
-    "essential": true,
-    "logConfiguration": {
-      "logDriver": "awslogs",
-      "options": {
-        "awslogs-group": "/ecs/deploy-lab",
-        "awslogs-region": "'$(aws configure get region)'",
-        "awslogs-stream-prefix": "ecs"
-      }
-    }
-  }]' \
-  --query 'taskDefinition.taskDefinitionArn' --output text)
-
-echo "New task definition: $NEW_TASK_DEF"
-```
-
-Now create the AppSpec content and trigger the deployment:
-
-```bash
-# Create the deployment with inline AppSpec referencing the new task definition
+# Create the deployment with inline AppSpec referencing $NEW_TASK_DEF
 DEPLOY_ID=$(aws deploy create-deployment \
   --application-name ecs-deploy-lab \
   --deployment-group-name ecs-deploy-lab-dg \
-  --revision '{
-    "revisionType": "AppSpecContent",
-    "appSpecContent": {
-      "content": "{\"version\": 0.0, \"Resources\": [{\"TargetService\": {\"Type\": \"AWS::ECS::Service\", \"Properties\": {\"TaskDefinition\": \"'"$NEW_TASK_DEF"'\", \"LoadBalancerInfo\": {\"ContainerName\": \"app\", \"ContainerPort\": 80}}}}], \"Hooks\": [{\"AfterAllowTestTraffic\": \"CodeDeployHook_ecs-deploy-lab-test-traffic\"}]}"
-    }
-  }' \
+  --revision '{"revisionType": "AppSpecContent", "appSpecContent": {"content": "{\"version\": 0.0, \"Resources\": [{\"TargetService\": {\"Type\": \"AWS::ECS::Service\", \"Properties\": {\"TaskDefinition\": \"'"$NEW_TASK_DEF"'\", \"LoadBalancerInfo\": {\"ContainerName\": \"app\", \"ContainerPort\": 80}}}}], \"Hooks\": [{\"AfterAllowTestTraffic\": \"CodeDeployHook_ecs-deploy-lab-test-traffic\"}]}"}}' \
   --query 'deploymentId' --output text)
 
 echo "Deployment: $DEPLOY_ID"
@@ -502,11 +531,13 @@ done
 During the deployment, you can observe the blue/green behavior. Once the green task set is up and the test listener routes to it:
 
 ```bash
-# Test listener shows v2 (alpine nginx returns slightly different headers)
-curl -I http://$ALB_DNS:8080
+# Test listener shows v2
+curl http://$ALB_DNS:8080
+# Expected: Hello World v2
 
 # Production listener still shows v1 until the hook passes and traffic shifts
-curl -I http://$ALB_DNS:80
+curl http://$ALB_DNS:80
+# Expected: Hello World v1
 ```
 
 The deployment sequence:
@@ -541,38 +572,15 @@ aws deploy update-deployment-group \
 
 ### Automatic Rollback
 
-Attach a CloudWatch alarm to the deployment group. If it fires during the deployment, CodeDeploy switches production traffic back to blue immediately:
+You can attach CloudWatch alarms to the deployment group (via `alarm-configuration`). If an alarm fires during the deployment — whether during the canary/linear traffic shifting phase or right after the full switch — CodeDeploy stops the deployment and switches the production listener back to the blue target group. This is instant because the blue task set remains alive during the termination wait period (5 minutes in our template). No new tasks need to launch; the ALB just flips back.
 
-```bash
-# Create an alarm on the green target group's 5xx rate
-aws cloudwatch put-metric-alarm \
-  --alarm-name ecs-deploy-lab-5xx \
-  --namespace AWS/ApplicationELB \
-  --metric-name HTTPCode_Target_5XX_Count \
-  --statistic Sum \
-  --period 60 \
-  --threshold 5 \
-  --comparison-operator GreaterThanThreshold \
-  --evaluation-periods 1 \
-  --dimensions Name=LoadBalancer,Value=$(aws elbv2 describe-load-balancers \
-    --names ecs-deploy-lab-alb --query 'LoadBalancers[0].LoadBalancerArn' \
-    --output text | sed 's|.*:loadbalancer/||')
-
-# Attach alarm to deployment group
-aws deploy update-deployment-group \
-  --application-name ecs-deploy-lab \
-  --current-deployment-group-name ecs-deploy-lab-dg \
-  --alarm-configuration enabled=true,alarms=[{name=ecs-deploy-lab-5xx}] \
-  --auto-rollback-configuration enabled=true,events=DEPLOYMENT_FAILURE,DEPLOYMENT_STOP_ON_ALARM
-```
-
-Rollback is instant because the blue task set remains alive during the termination wait period. CodeDeploy simply switches the production listener back to the blue target group — no new tasks need to launch.
+Two rollback triggers exist: `DEPLOYMENT_FAILURE` (hook reports failed, tasks won't start) and `DEPLOYMENT_STOP_ON_ALARM` (CloudWatch alarm fires during deployment). Both result in the same outcome — production traffic reverts to blue.
 
 ## Approach 2 — ECS Native Blue/Green
 
 ### How It Differs from CodeDeploy
 
-ECS native blue/green (launched July 2025) provides the same deployment safety without a separate CodeDeploy application. The key differences:
+ECS native blue/green provides the same deployment safety without a separate CodeDeploy application. The key differences:
 
 - **Deployment controller**: `ECS` (not `CODE_DEPLOY`)
 - **No AppSpec file** — deployment configuration is part of the ECS service definition
@@ -592,17 +600,40 @@ The ECS native lifecycle stages, in order:
 7. `PRODUCTION_TRAFFIC_SHIFT` — production traffic shifts (recurring for canary/linear)
 8. `POST_PRODUCTION_TRAFFIC_SHIFT` — after all production traffic is on green
 
+### Deployment Configuration — CodeDeploy Concepts Mapped to ECS Native
+
+With CodeDeploy, deployment behavior is spread across multiple resources: the deployment group defines target groups, listeners, and termination wait time; the deployment config defines the traffic shifting strategy; the AppSpec wires in the hooks.
+
+With ECS native, all of this collapses into a single deployment configuration on the ECS service itself. You specify:
+
+- **Deployment type**: blue/green (two task sets with ALB switching)
+- **Production listener**: which ALB listener serves real traffic
+- **Test listener**: which ALB listener routes to the replacement task set for validation
+- **Target groups**: the two target groups to switch between
+- **Termination wait time**: how long to keep the old task set alive after traffic shifts (rollback window)
+- **Circuit breaker**: auto-rollback on health check failures (replaces CodeDeploy's alarm + auto-rollback config)
+
+| CodeDeploy concept | ECS native equivalent |
+|----|-----|
+| Deployment group (target groups, listeners) | Blue/green configuration on the service |
+| Deployment config (`ECSCanary10Percent5Minutes`) | Traffic shifting configuration (shown in canary/linear section below) |
+| `TerminateBlueInstancesOnDeploymentSuccess` | Termination wait time |
+| Alarm + auto-rollback config | Deployment circuit breaker + CloudWatch alarms |
+| AppSpec hooks | ECS deployment lifecycle hooks (configured via API/CLI) |
+
+No separate CodeDeploy application, deployment group, or service role required.
+
 ### Prerequisites — CloudFormation Template (Native)
 
-This template provisions the same infrastructure but without any CodeDeploy resources. The lifecycle hook is configured directly on the ECS service:
+This template provisions the infrastructure: cluster, ALB with two target groups and two listeners, and a basic ECS service using the default rolling update strategy. We'll upgrade it to blue/green via CLI in the next step — separating infrastructure provisioning from deployment configuration.
 
 **`ecs-native-prerequisites.yaml`**:
 
 ```yaml
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  ECS native blue/green lab. Creates Fargate service with ALB,
-  two target groups, test listener, and native deployment configuration.
+  ECS native blue/green lab. Creates Fargate service with ALB and
+  two target groups. Service starts with rolling update — upgraded to blue/green via CLI.
 
 Parameters:
   VpcId:
@@ -664,6 +695,7 @@ Resources:
       Subnets: !Ref SubnetIds
       SecurityGroups: [!Ref ALBSecurityGroup]
 
+  # Two target groups ready for blue/green — both exist from the start
   BlueTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
@@ -684,6 +716,7 @@ Resources:
       TargetType: ip
       HealthCheckPath: /
 
+  # Production listener on port 80
   ProductionListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
@@ -694,6 +727,7 @@ Resources:
         - Type: forward
           TargetGroupArn: !Ref BlueTargetGroup
 
+  # Test listener on port 8080 — used during blue/green for pre-production validation
   TestListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
@@ -721,7 +755,20 @@ Resources:
       ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
       ContainerDefinitions:
         - Name: app
-          Image: public.ecr.aws/nginx/nginx:1.27
+          Image: public.ecr.aws/docker/library/node:20-alpine
+          Command:
+            - node
+            - -e
+            - |
+              const http = require('http');
+              const version = process.env.APP_VERSION || '1';
+              http.createServer((req, res) => {
+                res.writeHead(200, {'Content-Type': 'text/plain'});
+                res.end(`Hello World v${version}\n`);
+              }).listen(80);
+          Environment:
+            - Name: APP_VERSION
+              Value: '1'
           PortMappings:
             - ContainerPort: 80
           Essential: true
@@ -732,7 +779,7 @@ Resources:
               awslogs-region: !Ref AWS::Region
               awslogs-stream-prefix: ecs
 
-  # ECS Service — deployment controller ECS with blue/green configuration
+  # Service starts with default rolling update — no blue/green config yet
   Service:
     Type: AWS::ECS::Service
     DependsOn: ProductionListener
@@ -742,23 +789,8 @@ Resources:
       TaskDefinition: !Ref TaskDefinition
       DesiredCount: 2
       LaunchType: FARGATE
-      # ECS deployment controller — supports rolling, blue/green, canary, linear
       DeploymentController:
         Type: ECS
-      DeploymentConfiguration:
-        # Blue/green strategy with 5-minute bake time
-        DeploymentType: BLUE_GREEN
-        BlueGreenDeploymentConfiguration:
-          ProductionListenerArn: !Ref ProductionListener
-          TestListenerArn: !Ref TestListener
-          TargetGroups:
-            - !Ref BlueTargetGroup
-            - !Ref GreenTargetGroup
-          TerminationWaitTimeInMinutes: 5
-        # Circuit breaker for automatic rollback on health check failures
-        DeploymentCircuitBreaker:
-          Enable: true
-          Rollback: true
       NetworkConfiguration:
         AwsvpcConfiguration:
           AssignPublicIp: ENABLED
@@ -776,9 +808,15 @@ Outputs:
     Value: !Ref Cluster
   ServiceName:
     Value: !GetAtt Service.Name
+  ProductionListenerArn:
+    Value: !Ref ProductionListener
+  TestListenerArn:
+    Value: !Ref TestListener
+  BlueTargetGroupArn:
+    Value: !Ref BlueTargetGroup
+  GreenTargetGroupArn:
+    Value: !Ref GreenTargetGroup
 ```
-
-Notice what's missing compared to the CodeDeploy template: no `AWS::CodeDeploy::Application`, no `AWS::CodeDeploy::DeploymentGroup`, no CodeDeploy service role. The deployment configuration lives directly on the ECS service.
 
 Deploy the stack:
 
@@ -794,36 +832,98 @@ aws cloudformation deploy \
 # Store outputs
 NATIVE_ALB=$(aws cloudformation describe-stacks --stack-name ecs-native-lab \
   --query 'Stacks[0].Outputs[?OutputKey==`ALBDns`].OutputValue' --output text)
+PROD_LISTENER=$(aws cloudformation describe-stacks --stack-name ecs-native-lab \
+  --query 'Stacks[0].Outputs[?OutputKey==`ProductionListenerArn`].OutputValue' --output text)
+TEST_LISTENER=$(aws cloudformation describe-stacks --stack-name ecs-native-lab \
+  --query 'Stacks[0].Outputs[?OutputKey==`TestListenerArn`].OutputValue' --output text)
+BLUE_TG=$(aws cloudformation describe-stacks --stack-name ecs-native-lab \
+  --query 'Stacks[0].Outputs[?OutputKey==`BlueTargetGroupArn`].OutputValue' --output text)
+GREEN_TG=$(aws cloudformation describe-stacks --stack-name ecs-native-lab \
+  --query 'Stacks[0].Outputs[?OutputKey==`GreenTargetGroupArn`].OutputValue' --output text)
 
+# Verify v1 is serving traffic
 curl http://$NATIVE_ALB
+# Expected: Hello World v1
 ```
+
+### Enabling Blue/Green on the Service
+
+The service currently uses rolling update. Upgrade it to blue/green by updating the deployment configuration. This is where we wire in the target groups, listeners, termination wait time, and circuit breaker — all the settings that CodeDeploy would need a separate deployment group for:
+
+```bash
+# Upgrade the service from rolling update to blue/green
+aws ecs update-service \
+  --cluster ecs-native-deploy-lab \
+  --service native-deploy-lab-service \
+  --deployment-configuration '{
+    "deploymentType": "BLUE_GREEN",
+    "blueGreenDeploymentConfiguration": {
+      "productionListenerArn": "'"$PROD_LISTENER"'",
+      "testListenerArn": "'"$TEST_LISTENER"'",
+      "targetGroups": ["'"$BLUE_TG"'", "'"$GREEN_TG"'"],
+      "terminationWaitTimeInMinutes": 5
+    },
+    "deploymentCircuitBreaker": {
+      "enable": true,
+      "rollback": true
+    }
+  }'
+```
+
+That single command replaces what CodeDeploy needs an entire deployment group, service role, and deployment style configuration to achieve. The service is now ready for blue/green deployments.
 
 ### Deploy v2 with ECS Native
 
-With ECS native blue/green, you trigger a deployment by updating the service's task definition. No AppSpec, no `create-deployment` — just `update-service`:
+With blue/green enabled, you trigger a deployment by updating the service's task definition. No AppSpec, no `create-deployment` — just `update-service`:
 
-```bash
-# Register a new task definition revision (same as before — switch to alpine)
-NEW_TASK_DEF=$(aws ecs register-task-definition \
-  --family ecs-native-deploy-lab \
-  --cpu '256' --memory '512' \
-  --network-mode awsvpc \
-  --requires-compatibilities FARGATE \
-  --execution-role-arn $(aws iam get-role --role-name ecs-native-deploy-lab-execution-role --query 'Role.Arn' --output text) \
-  --container-definitions '[{
-    "name": "app",
-    "image": "public.ecr.aws/nginx/nginx:1.27-alpine",
-    "portMappings": [{"containerPort": 80}],
-    "essential": true,
-    "logConfiguration": {
-      "logDriver": "awslogs",
-      "options": {
-        "awslogs-group": "/ecs/native-deploy-lab",
-        "awslogs-region": "'$(aws configure get region)'",
-        "awslogs-stream-prefix": "ecs"
+**`task-definition-v2.json`** (same app, different family name for the native lab):
+
+```json
+{
+  "family": "ecs-native-deploy-lab",
+  "cpu": "256",
+  "memory": "512",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "executionRoleArn": "<EXECUTION_ROLE_ARN>",
+  "containerDefinitions": [
+    {
+      "name": "app",
+      "image": "public.ecr.aws/docker/library/node:20-alpine",
+      "command": [
+        "node", "-e",
+        "const http = require('http'); const version = process.env.APP_VERSION || '1'; http.createServer((req, res) => { res.writeHead(200, {'Content-Type': 'text/plain'}); res.end(`Hello World v${version}\\n`); }).listen(80);"
+      ],
+      "environment": [
+        { "name": "APP_VERSION", "value": "2" }
+      ],
+      "portMappings": [{ "containerPort": 80 }],
+      "essential": true,
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/native-deploy-lab",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
       }
     }
-  }]' \
+  ]
+}
+```
+
+Register the task definition and update the service to trigger the deployment:
+
+```bash
+# Inject the execution role ARN
+EXEC_ROLE=$(aws iam get-role --role-name ecs-native-deploy-lab-execution-role \
+  --query 'Role.Arn' --output text)
+
+sed -i "s|<EXECUTION_ROLE_ARN>|$EXEC_ROLE|" task-definition-v2.json
+
+# Register the new revision
+NEW_TASK_DEF=$(aws ecs register-task-definition \
+  --cli-input-json file://task-definition-v2.json \
   --query 'taskDefinition.taskDefinitionArn' --output text)
 
 # Update the service — this triggers the blue/green deployment
@@ -847,45 +947,34 @@ During deployment, test both listeners:
 
 ```bash
 # Test listener (8080) shows green task set
-curl -I http://$NATIVE_ALB:8080
+curl http://$NATIVE_ALB:8080
+# Expected: Hello World v2
 
 # Production listener (80) still shows blue until traffic shifts
-curl -I http://$NATIVE_ALB:80
+curl http://$NATIVE_ALB:80
+# Expected: Hello World v1
 ```
 
 ### ECS Native Canary and Linear
 
-To use gradual traffic shifting instead of all-at-once, update the service's deployment configuration. ECS native supports canary and linear strategies directly:
+The `update-service` command that enabled blue/green used an all-at-once traffic shift (the default). To use gradual traffic shifting, add a `trafficShiftingConfiguration` to the blue/green configuration.
 
-```bash
-# Update to canary — 10% for 5 minutes, then 100%
-aws ecs update-service \
-  --cluster ecs-native-deploy-lab \
-  --service native-deploy-lab-service \
-  --deployment-configuration '{
-    "deploymentType": "BLUE_GREEN",
-    "blueGreenDeploymentConfiguration": {
-      "productionListenerArn": "<PROD_LISTENER_ARN>",
-      "testListenerArn": "<TEST_LISTENER_ARN>",
-      "targetGroups": ["<BLUE_TG_ARN>", "<GREEN_TG_ARN>"],
-      "terminationWaitTimeInMinutes": 5,
-      "trafficShiftingConfiguration": {
-        "type": "CANARY",
-        "canaryConfiguration": {
-          "initialTrafficPercentage": 10,
-          "intervalInSeconds": 300,
-          "numberOfIntervals": 1
-        }
-      }
-    },
-    "deploymentCircuitBreaker": {
-      "enable": true,
-      "rollback": true
-    }
-  }'
+**Canary** — shifts an initial percentage of traffic, waits, then shifts the rest:
+
+```json
+"trafficShiftingConfiguration": {
+  "type": "CANARY",
+  "canaryConfiguration": {
+    "initialTrafficPercentage": 10,
+    "intervalInSeconds": 300,
+    "numberOfIntervals": 1
+  }
+}
 ```
 
-For linear deployments, replace the traffic shifting configuration:
+This shifts 10% of traffic for 5 minutes (300 seconds), then the remaining 90%.
+
+**Linear** — shifts traffic in equal increments at regular intervals:
 
 ```json
 "trafficShiftingConfiguration": {
@@ -897,7 +986,9 @@ For linear deployments, replace the traffic shifting configuration:
 }
 ```
 
-CloudWatch alarms can be attached at the ECS service level for automatic rollback during the canary/linear observation windows.
+This shifts 10% every 60 seconds — full cutover in 10 minutes.
+
+Both configurations go inside `blueGreenDeploymentConfiguration` in the `--deployment-configuration` argument. CloudWatch alarms can be attached at the ECS service level for automatic rollback during the observation windows — if an alarm fires mid-shift, ECS reverts traffic to the blue task set.
 
 ## Comparison: Choosing Between Approaches
 
