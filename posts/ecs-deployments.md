@@ -165,7 +165,7 @@ Resources:
         - Type: forward
           TargetGroupArn: !Ref BlueTargetGroup
 
-  # Test listener — port 8080, routes to green target group during deployment
+  # Test listener — port 8080, initially points to blue (CodeDeploy switches it to green during deployment)
   TestListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
@@ -348,11 +348,13 @@ Resources:
             try {
               // Hit the test listener to validate the green task set
               const response = await fetch(process.env.TEST_URL);
+              const body = await response.text();
               if (response.ok) {
                 console.log("Test traffic validation passed — HTTP", response.status);
+                console.log("Response from green task set:", body.trim());
                 status = "Succeeded";
               } else {
-                console.error("Test traffic validation failed — HTTP", response.status);
+                console.error("Test traffic validation failed — HTTP", response.status, body);
               }
             } catch (err) {
               console.error("Test traffic validation error:", err);
@@ -528,25 +530,31 @@ while true; do
 done
 ```
 
-During the deployment, you can observe the blue/green behavior. Once the green task set is up and the test listener routes to it:
+Once the deployment succeeds, check the hook's CloudWatch Logs to confirm it validated the new version via the test listener:
+
+```
+INFO Test traffic validation passed — HTTP 200
+INFO Response from green task set: Hello World v2
+```
+
+This log proves the test listener was routing to the green task set during `AfterAllowTestTraffic`. The hook invoked port 8080, received "Hello World v2" from the new tasks, and reported `Succeeded` — triggering the production traffic shift.
+
+After the deployment completes, production traffic (port 80) now serves v2:
 
 ```bash
-# Test listener shows v2
-curl http://$ALB_DNS:8080
+curl http://$ALB_DNS
 # Expected: Hello World v2
-
-# Production listener still shows v1 until the hook passes and traffic shifts
-curl http://$ALB_DNS:80
-# Expected: Hello World v1
 ```
 
 The deployment sequence:
 1. Green task set spins up with the new task definition
-2. Tasks pass ALB health checks
-3. Test listener (port 8080) switches to the green target group
-4. `AfterAllowTestTraffic` hook fires → Lambda validates via test listener
+2. Tasks register in the green target group and pass ALB health checks
+3. CodeDeploy switches test listener (port 8080) to the green target group
+4. `AfterAllowTestTraffic` hook fires → Lambda hits port 8080, confirms "Hello World v2"
 5. Hook reports `Succeeded` → production listener (port 80) shifts to green
-6. 5-minute wait period → blue task set terminates
+6. 5-minute termination wait → blue task set terminates
+
+> **Note:** The test traffic phase (steps 3–5) is only as long as your hook takes to run. In this lab, the hook completes in ~3 seconds, making it hard to observe by manually curling. In a real project, hooks run integration test suites that take 30–60+ seconds, giving you a meaningful validation window.
 
 ### Traffic Shifting Options with CodeDeploy
 
