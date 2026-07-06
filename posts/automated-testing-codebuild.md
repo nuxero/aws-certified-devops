@@ -813,3 +813,5 @@ Buildspec phases give you a natural testing pyramid: fast checks gate slow check
 CodeBuild's test reports give your team visibility without external tooling. No Jenkins plugins, no third-party dashboards, no extra infrastructure to maintain. Every test run produces a structured report that anyone can read.
 
 The pattern scales: add more test types (contract tests, security scans, performance benchmarks), more report groups, more phases. The structure stays the same — fast gates first, slow gates later, fail early and loudly.
+
+Interested on taking your CI testing to the next level? At [AgilityFeat](https://agilityfeat.com/) we specialize of building high quality software solutions taking advantage of the best DevOps, continuos integration and testing best practices. We can help you boost your software product and development process. [Contact us](https://agilityfeat.com/contact-us/) to known more of what we can do to help.
