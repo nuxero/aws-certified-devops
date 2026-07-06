@@ -1,0 +1,31 @@
+{
+  "family": "ecs-deploy-lab",
+  "cpu": "256",
+  "memory": "512",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "executionRoleArn": "arn:aws:iam::768330363917:role/ecs-deploy-lab-execution-role",
+  "containerDefinitions": [
+    {
+      "name": "app",
+      "image": "public.ecr.aws/docker/library/node:20-alpine",
+      "command": [
+        "node", "-e",
+        "const http = require('http'); const version = process.env.APP_VERSION || '1'; http.createServer((req, res) => { res.writeHead(200, {'Content-Type': 'text/plain'}); res.end(`Hello World v${version}\\n`); }).listen(80);"
+      ],
+      "environment": [
+        { "name": "APP_VERSION", "value": "2" }
+      ],
+      "portMappings": [{ "containerPort": 80 }],
+      "essential": true,
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/deploy-lab",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}

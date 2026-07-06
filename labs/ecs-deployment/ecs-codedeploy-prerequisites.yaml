@@ -77,6 +77,10 @@ Resources:
       VpcId: !Ref VpcId
       TargetType: ip
       HealthCheckPath: /
+      HealthCheckIntervalSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      HealthCheckTimeoutSeconds: 3
 
   GreenTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
@@ -87,6 +91,10 @@ Resources:
       VpcId: !Ref VpcId
       TargetType: ip
       HealthCheckPath: /
+      HealthCheckIntervalSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      HealthCheckTimeoutSeconds: 3
 
   # Production listener — port 80, routes to blue target group
   ProductionListener:
@@ -99,7 +107,7 @@ Resources:
         - Type: forward
           TargetGroupArn: !Ref BlueTargetGroup
 
-  # Test listener — port 8080, routes to green target group during deployment
+  # Test listener — port 8080, initially points to blue (CodeDeploy switches it to green during deployment)
   TestListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
@@ -110,7 +118,7 @@ Resources:
         - Type: forward
           TargetGroupArn: !Ref BlueTargetGroup
 
-  # Task definition — nginx serving a simple page (v1)
+  # Task definition — simple Node.js HTTP server returning "Hello World v1"
   TaskDefinition:
     Type: AWS::ECS::TaskDefinition
     Properties:
@@ -122,8 +130,21 @@ Resources:
       ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
       ContainerDefinitions:
         - Name: app
-          # Using the public nginx image from Amazon ECR Public Gallery
-          Image: public.ecr.aws/nginx/nginx:1.27
+          Image: public.ecr.aws/docker/library/node:20-alpine
+          # Inline HTTP server — returns the version from APP_VERSION env var
+          Command:
+            - node
+            - -e
+            - |
+              const http = require('http');
+              const version = process.env.APP_VERSION || '1';
+              http.createServer((req, res) => {
+                res.writeHead(200, {'Content-Type': 'text/plain'});
+                res.end(`Hello World v${version}\n`);
+              }).listen(80);
+          Environment:
+            - Name: APP_VERSION
+              Value: '1'
           PortMappings:
             - ContainerPort: 80
           Essential: true
@@ -267,13 +288,20 @@ Resources:
             let status = "Failed";
 
             try {
+              // Wait for the ALB test listener to finish switching to the green target group.
+              // CodeDeploy fires this hook immediately after initiating the switch, but the
+              // ALB needs a few seconds to complete the routing change.
+              await new Promise(resolve => setTimeout(resolve, 10000));
+
               // Hit the test listener to validate the green task set
               const response = await fetch(process.env.TEST_URL);
+              const body = await response.text();
               if (response.ok) {
                 console.log("Test traffic validation passed — HTTP", response.status);
+                console.log("Response from green task set:", body.trim());
                 status = "Succeeded";
               } else {
-                console.error("Test traffic validation failed — HTTP", response.status);
+                console.error("Test traffic validation failed — HTTP", response.status, body);
               }
             } catch (err) {
               console.error("Test traffic validation error:", err);

@@ -143,6 +143,10 @@ Resources:
       VpcId: !Ref VpcId
       TargetType: ip
       HealthCheckPath: /
+      HealthCheckIntervalSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      HealthCheckTimeoutSeconds: 3
 
   GreenTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
@@ -153,6 +157,10 @@ Resources:
       VpcId: !Ref VpcId
       TargetType: ip
       HealthCheckPath: /
+      HealthCheckIntervalSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      HealthCheckTimeoutSeconds: 3
 
   # Production listener — port 80, routes to blue target group
   ProductionListener:
@@ -346,6 +354,11 @@ Resources:
             let status = "Failed";
 
             try {
+              // Wait for the ALB test listener to finish switching to the green target group.
+              // CodeDeploy fires this hook immediately after initiating the switch, but the
+              // ALB needs a few seconds to complete the routing change.
+              await new Promise(resolve => setTimeout(resolve, 10000));
+
               // Hit the test listener to validate the green task set
               const response = await fetch(process.env.TEST_URL);
               const body = await response.text();
@@ -532,6 +545,13 @@ done
 
 Once the deployment succeeds, check the hook's CloudWatch Logs to confirm it validated the new version via the test listener:
 
+```bash
+# Fetch the most recent log stream from the hook function
+aws logs tail /aws/lambda/CodeDeployHook_ecs-deploy-lab-test-traffic --since 10m
+```
+
+You should see output like:
+
 ```
 INFO Test traffic validation passed — HTTP 200
 INFO Response from green task set: Hello World v2
@@ -554,7 +574,7 @@ The deployment sequence:
 5. Hook reports `Succeeded` → production listener (port 80) shifts to green
 6. 5-minute termination wait → blue task set terminates
 
-> **Note:** The test traffic phase (steps 3–5) is only as long as your hook takes to run. In this lab, the hook completes in ~3 seconds, making it hard to observe by manually curling. In a real project, hooks run integration test suites that take 30–60+ seconds, giving you a meaningful validation window.
+> **Note:** In our testing, the ALB listener switch (step 3) takes a few seconds to propagate before traffic actually routes to the new target group. CodeDeploy marks the switch as complete and fires the hook immediately, but the ALB hasn't finished routing yet. This is a [known ALB behavior](https://repost.aws/questions/QU83vc4Oc-QPCu04XEAOzN7Q/application-load-balancer-504-errors-with-weighted-target-group) — changes take a few seconds to propagate. The hook includes a 10-second wait to account for this. In production hooks running full test suites, the setup time before the first HTTP request naturally covers this delay.
 
 ### Traffic Shifting Options with CodeDeploy
 
@@ -713,6 +733,10 @@ Resources:
       VpcId: !Ref VpcId
       TargetType: ip
       HealthCheckPath: /
+      HealthCheckIntervalSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      HealthCheckTimeoutSeconds: 3
 
   GreenTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
@@ -723,6 +747,10 @@ Resources:
       VpcId: !Ref VpcId
       TargetType: ip
       HealthCheckPath: /
+      HealthCheckIntervalSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      HealthCheckTimeoutSeconds: 3
 
   # Production listener on port 80
   ProductionListener:
