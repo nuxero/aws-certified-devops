@@ -574,7 +574,7 @@ The deployment sequence:
 5. Hook reports `Succeeded` → production listener (port 80) shifts to green
 6. 5-minute termination wait → blue task set terminates
 
-> **Note:** In our testing, the ALB listener switch (step 3) takes a few seconds to propagate before traffic actually routes to the new target group. CodeDeploy marks the switch as complete and fires the hook immediately, but the ALB hasn't finished routing yet. This is a [known ALB behavior](https://repost.aws/questions/QU83vc4Oc-QPCu04XEAOzN7Q/application-load-balancer-504-errors-with-weighted-target-group) — changes take a few seconds to propagate. The hook includes a 10-second wait to account for this. In production hooks running full test suites, the setup time before the first HTTP request naturally covers this delay.
+> **Note:** In our testing, the ALB listener switch (step 3) takes a few seconds to propagate before traffic actually routes to the new target group. CodeDeploy marks the switch as complete and fires the hook immediately, but the ALB hasn't finished routing yet. This is a [known ALB behavior](https://repost.aws/questions/QU83vc4Oc-QPCu04XEAOzN7Q/application-load-balancer-504-errors-with-weighted-target-group) — changes take a few seconds to propagate. The hook includes a 10-second wait to account for this. In production hooks running full test suites, the setup time before the first HTTP request should naturally covers this delay.
 
 ### Traffic Shifting Options with CodeDeploy
 
@@ -653,7 +653,7 @@ No separate CodeDeploy application, deployment group, or service role required.
 
 ### Prerequisites — CloudFormation Template (Native)
 
-This template provisions the infrastructure: cluster, ALB with two target groups and two listeners, and a basic ECS service using the default rolling update strategy. We'll upgrade it to blue/green via CLI in the next step — separating infrastructure provisioning from deployment configuration.
+This template provisions the infrastructure: cluster, ALB with two target groups and two listeners, and a basic ECS service using the default rolling update strategy. We'll upgrade it to blue/green via CLI in the next step.
 
 **`ecs-native-prerequisites.yaml`**:
 
@@ -815,6 +815,21 @@ Resources:
               awslogs-region: !Ref AWS::Region
               awslogs-stream-prefix: ecs
 
+  # ECS infrastructure role — allows ECS to manage load balancer resources for blue/green
+  ECSInfrastructureRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ecs-native-deploy-lab-infra-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSInfrastructureRolePolicyForLoadBalancers
+
   # Service starts with default rolling update — no blue/green config yet
   Service:
     Type: AWS::ECS::Service
@@ -852,6 +867,8 @@ Outputs:
     Value: !Ref BlueTargetGroup
   GreenTargetGroupArn:
     Value: !Ref GreenTargetGroup
+  ECSInfrastructureRoleArn:
+    Value: !GetAtt ECSInfrastructureRole.Arn
 ```
 
 Deploy the stack:
@@ -876,6 +893,8 @@ BLUE_TG=$(aws cloudformation describe-stacks --stack-name ecs-native-lab \
   --query 'Stacks[0].Outputs[?OutputKey==`BlueTargetGroupArn`].OutputValue' --output text)
 GREEN_TG=$(aws cloudformation describe-stacks --stack-name ecs-native-lab \
   --query 'Stacks[0].Outputs[?OutputKey==`GreenTargetGroupArn`].OutputValue' --output text)
+INFRA_ROLE=$(aws cloudformation describe-stacks --stack-name ecs-native-lab \
+  --query 'Stacks[0].Outputs[?OutputKey==`ECSInfrastructureRoleArn`].OutputValue' --output text)
 
 # Verify v1 is serving traffic
 curl http://$NATIVE_ALB
@@ -884,25 +903,30 @@ curl http://$NATIVE_ALB
 
 ### Enabling Blue/Green on the Service
 
-The service currently uses rolling update. Upgrade it to blue/green by updating the deployment configuration. This is where we wire in the target groups, listeners, termination wait time, and circuit breaker — all the settings that CodeDeploy would need a separate deployment group for:
+The service currently uses rolling update. Upgrade it to blue/green by updating the load balancer configuration (to wire in the alternate target group and listeners) and the deployment strategy. This requires two settings:
+
+1. `--load-balancers` with `advancedConfiguration` — tells ECS which alternate target group, listeners, and IAM role to use for traffic shifting
+2. `--deployment-configuration` with `strategy: BLUE_GREEN` — enables the blue/green deployment strategy with a bake time
 
 ```bash
 # Upgrade the service from rolling update to blue/green
 aws ecs update-service \
   --cluster ecs-native-deploy-lab \
   --service native-deploy-lab-service \
-  --deployment-configuration '{
-    "deploymentType": "BLUE_GREEN",
-    "blueGreenDeploymentConfiguration": {
-      "productionListenerArn": "'"$PROD_LISTENER"'",
-      "testListenerArn": "'"$TEST_LISTENER"'",
-      "targetGroups": ["'"$BLUE_TG"'", "'"$GREEN_TG"'"],
-      "terminationWaitTimeInMinutes": 5
-    },
-    "deploymentCircuitBreaker": {
-      "enable": true,
-      "rollback": true
+  --load-balancers '[{
+    "containerName": "app",
+    "containerPort": 80,
+    "targetGroupArn": "'"$BLUE_TG"'",
+    "advancedConfiguration": {
+      "alternateTargetGroupArn": "'"$GREEN_TG"'",
+      "productionListenerRule": "'"$PROD_LISTENER"'",
+      "testListenerRule": "'"$TEST_LISTENER"'",
+      "roleArn": "'"$INFRA_ROLE"'"
     }
+  }]' \
+  --deployment-configuration '{
+    "strategy": "BLUE_GREEN",
+    "bakeTimeInMinutes": 5
   }'
 ```
 
