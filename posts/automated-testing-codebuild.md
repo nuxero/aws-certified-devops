@@ -224,7 +224,7 @@ mkdir multi-stage-testing-lab && cd multi-stage-testing-lab
 git init
 ```
 
-> After creating all the files below, run `npm install` once locally to generate `package-lock.json`. This lockfile must be committed — `npm ci` in the buildspec requires it for deterministic installs.
+> After creating all the files below, run `npm install` once locally to generate `package-lock.json`. This lockfile must be committed — `npm ci` in the buildspec requires it for deterministic installs. If you're curious about how npm's [lifecycle scripts](https://agilityfeat.com/blog/understanding-npm-lifecycle-scripts/) interact during install and build, it's worth understanding before debugging CI failures.
 
 The `package.json` defines our dependencies and test scripts. We have separate scripts for linting, unit tests, and integration tests — each producing JUnit XML output that CodeBuild's reporting feature can consume. The `mocha-junit-reporter` outputs structured XML, and `supertest` lets our integration tests make HTTP requests against the Express app without manually starting a server.
 
@@ -696,7 +696,7 @@ The CodeBuild project works standalone, but for production use there are two enh
 
 ### Connecting to CodePipeline
 
-In a real workflow you'd wrap the CodeBuild project in a [CodePipeline](https://aws.amazon.com/codepipeline/) that triggers automatically on every push and chains into deployment stages.
+In a real workflow you'd wrap the CodeBuild project in a [CodePipeline](https://aws.amazon.com/codepipeline/) that triggers automatically on every push and chains into deployment stages. For containerized workloads, you'd take the build artifact and [deploy it to ECS Fargate with a full CI/CD pipeline](https://agilityfeat.com/blog/how-to-deploy-containerized-mvp-on-aws-ecs-fargate-with-terraform-and-github-actions/).
 
 Here's what that pipeline structure looks like:
 
@@ -813,5 +813,3 @@ Buildspec phases give you a natural testing pyramid: fast checks gate slow check
 CodeBuild's test reports give your team visibility without external tooling. No Jenkins plugins, no third-party dashboards, no extra infrastructure to maintain. Every test run produces a structured report that anyone can read.
 
 The pattern scales: add more test types (contract tests, security scans, performance benchmarks), more report groups, more phases. The structure stays the same — fast gates first, slow gates later, fail early and loudly.
-
-Interested on taking your CI testing to the next level? At [AgilityFeat](https://agilityfeat.com/) we specialize of building high quality software solutions taking advantage of the best DevOps, continuos integration and testing best practices. We can help you boost your software product and development process. [Contact us](https://agilityfeat.com/contact-us/) to known more of what we can do to help.
