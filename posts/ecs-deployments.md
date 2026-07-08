@@ -828,7 +828,7 @@ Resources:
               Service: ecs.amazonaws.com
             Action: sts:AssumeRole
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AmazonECSInfrastructureRolePolicyForLoadBalancers
+        - arn:aws:iam::aws:policy/AmazonECSInfrastructureRolePolicyForLoadBalancers
 
   # Service starts with default rolling update — no blue/green config yet
   Service:
@@ -896,6 +896,13 @@ GREEN_TG=$(aws cloudformation describe-stacks --stack-name ecs-native-lab \
 INFRA_ROLE=$(aws cloudformation describe-stacks --stack-name ecs-native-lab \
   --query 'Stacks[0].Outputs[?OutputKey==`ECSInfrastructureRoleArn`].OutputValue' --output text)
 
+# The update-service API requires Listener Rule ARNs, not Listener ARNs.
+# Each listener has a default rule — retrieve those rule ARNs:
+PROD_RULE=$(aws elbv2 describe-rules --listener-arn "$PROD_LISTENER" \
+  --query "Rules[0].RuleArn" --output text)
+TEST_RULE=$(aws elbv2 describe-rules --listener-arn "$TEST_LISTENER" \
+  --query "Rules[0].RuleArn" --output text)
+
 # Verify v1 is serving traffic
 curl http://$NATIVE_ALB
 # Expected: Hello World v1
@@ -905,8 +912,10 @@ curl http://$NATIVE_ALB
 
 The service currently uses rolling update. Upgrade it to blue/green by updating the load balancer configuration (to wire in the alternate target group and listeners) and the deployment strategy. This requires two settings:
 
-1. `--load-balancers` with `advancedConfiguration` — tells ECS which alternate target group, listeners, and IAM role to use for traffic shifting
+1. `--load-balancers` with `advancedConfiguration` — tells ECS which alternate target group, listener rules, and IAM role to use for traffic shifting
 2. `--deployment-configuration` with `strategy: BLUE_GREEN` — enables the blue/green deployment strategy with a bake time
+
+> **Important:** The `productionListenerRule` and `testListenerRule` fields require **Listener Rule ARNs**, not Listener ARNs. Every listener has at least one default rule — that's what you pass here. The rule ARN has an additional `/rules/<rule-id>` segment compared to the listener ARN.
 
 ```bash
 # Upgrade the service from rolling update to blue/green
@@ -919,8 +928,8 @@ aws ecs update-service \
     "targetGroupArn": "'"$BLUE_TG"'",
     "advancedConfiguration": {
       "alternateTargetGroupArn": "'"$GREEN_TG"'",
-      "productionListenerRule": "'"$PROD_LISTENER"'",
-      "testListenerRule": "'"$TEST_LISTENER"'",
+      "productionListenerRule": "'"$PROD_RULE"'",
+      "testListenerRule": "'"$TEST_RULE"'",
       "roleArn": "'"$INFRA_ROLE"'"
     }
   }]' \
@@ -930,7 +939,14 @@ aws ecs update-service \
   }'
 ```
 
-That single command replaces what CodeDeploy needs an entire deployment group, service role, and deployment style configuration to achieve. The service is now ready for blue/green deployments.
+With the CodeDeploy approach, this same setup requires a separate CodeDeploy application, deployment group, service role, and AppSpec file. Here it's a single `update-service` call. The service is now ready for blue/green deployments.
+
+> **Note:** Enabling blue/green triggers an initial migration deployment — ECS creates a new task set and shifts traffic to it to establish the blue/green state. Wait for this deployment to complete (~2 minutes + bake time) before triggering the v2 deployment:
+
+```bash
+# Wait for the migration deployment to stabilize
+aws ecs wait services-stable --cluster ecs-native-deploy-lab --services native-deploy-lab-service
+```
 
 ### Deploy v2 with ECS Native
 
@@ -993,27 +1009,30 @@ aws ecs update-service \
   --task-definition "$NEW_TASK_DEF"
 ```
 
-ECS handles the rest: creates the green task set, waits for health checks, routes test traffic, and shifts production traffic. Monitor the deployment:
+ECS handles the rest: creates the green task set, waits for health checks, routes test traffic, and shifts production traffic. Poll both listeners to observe the blue/green progression:
 
 ```bash
-# Watch the service deployment status
-aws ecs describe-services \
-  --cluster ecs-native-deploy-lab \
-  --services native-deploy-lab-service \
-  --query 'services[0].deployments[*].{Status:status,TaskDef:taskDefinition,DesiredCount:desiredCount,RunningCount:runningCount}'
+# Poll both listeners every 10 seconds to observe the traffic shift
+while true; do
+  PROD=$(curl -s http://$NATIVE_ALB:80)
+  TEST=$(curl -s http://$NATIVE_ALB:8080)
+  echo "$(date +%H:%M:%S) prod=$PROD test=$TEST"
+  if [ "$PROD" = "Hello World v2" ]; then break; fi
+  sleep 10
+done
 ```
 
-During deployment, test both listeners:
+You'll see the progression:
 
-```bash
-# Test listener (8080) shows green task set
-curl http://$NATIVE_ALB:8080
-# Expected: Hello World v2
-
-# Production listener (80) still shows blue until traffic shifts
-curl http://$NATIVE_ALB:80
-# Expected: Hello World v1
 ```
+09:30:25 prod=Hello World v1 test=Hello World v1   # green tasks starting up
+09:30:35 prod=Hello World v1 test=Hello World v1   # still waiting for health checks
+09:31:05 prod=Hello World v1 test=Hello World v2   # test listener shifted to green
+09:31:15 prod=Hello World v1 test=Hello World v2   # bake time / validation window
+09:31:25 prod=Hello World v2 test=Hello World v2   # production traffic shifted
+```
+
+The same blue/green mechanics as CodeDeploy — test listener routes to green first, production follows — but without the AppSpec, CodeDeploy application, or deployment group.
 
 ### ECS Native Canary and Linear
 
@@ -1061,11 +1080,11 @@ Both configurations go inside `blueGreenDeploymentConfiguration` in the `--deplo
 | Traffic strategies | AllAtOnce, Canary, Linear | AllAtOnce, Canary, Linear | Rolling (min healthy %) |
 | Rollback speed | Instant (ALB switch) | Instant (ALB switch) | Slow (must launch old tasks again) |
 | CodePipeline integration | CodeDeploy deploy action | ECS deploy action | ECS deploy action |
-| When to use | Existing CodeDeploy pipelines, need consistency | Most new production deployments | Dev/test, simple services |
+| When to use | Legacy pipelines, existing CodeDeploy infrastructure | New deployments (default choice) | Dev/test, simple services |
 
 Decision framework:
-- Already have CodeDeploy pipelines and want to keep consistency? → CodeDeploy
-- New deployment, want lifecycle hooks with less configuration? → ECS Native
+- **Starting fresh?** → ECS Native. Same capabilities, less infrastructure, tighter integration.
+- Already invested in CodeDeploy pipelines? → CodeDeploy until you have a reason to migrate.
 - Dev environment, minimal config? → Rolling Update
 
 ## Clean Up
@@ -1081,6 +1100,9 @@ aws ecs list-task-definitions --family-prefix ecs-native-deploy-lab
 for arn in $(aws ecs list-task-definitions --family-prefix ecs-deploy-lab --query 'taskDefinitionArns[]' --output text); do
   aws ecs deregister-task-definition --task-definition $arn > /dev/null
 done
+for arn in $(aws ecs list-task-definitions --family-prefix ecs-native-deploy-lab --query 'taskDefinitionArns[]' --output text); do
+  aws ecs deregister-task-definition --task-definition $arn > /dev/null; 
+done
 ```
 
 Delete the CloudFormation stacks:
@@ -1094,7 +1116,7 @@ aws cloudformation wait stack-delete-complete --stack-name ecs-codedeploy-lab
 aws cloudformation delete-stack --stack-name ecs-native-lab
 aws cloudformation wait stack-delete-complete --stack-name ecs-native-lab
 
-# Delete the CloudWatch alarm
+# Delete the CloudWatch alarm if created
 aws cloudwatch delete-alarms --alarm-names ecs-deploy-lab-5xx
 ```
 
