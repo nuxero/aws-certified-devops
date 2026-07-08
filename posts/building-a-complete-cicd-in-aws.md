@@ -12,12 +12,10 @@ Let's dive in.
 
 ## Prerequisites & Application Code
 
-Before starting, make sure you have the AWS CLI v2 installed and configured (`aws configure`).
+Before starting, make sure you have the [AWS CLI v2 installed and configured](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) (`aws configure`).
 You also need a VPC with at least one public subnet for the Fargate task to run in — the default VPC that comes with every AWS account works fine.
 
-Create a new GitHub repository called `my-web-app` and add the following two files. This is the application we will be deploying.
-
-To kick things off, we need an actual application to deploy. We'll build a lightweight web server using modern Node.js features like ECMAScript Modules (ESM) and the nullish coalescing operator.
+To kick things off, we need an actual application to deploy, so create a new GitHub repository called `my-web-app` and add the following two files, which build a lightweight web server using modern Node.js features like ECMAScript Modules (ESM) and the nullish coalescing operator.
 
 This application uses the built-in `node:http` module to listen for incoming requests and responds with a simple JSON payload. It also reads environment variables, which we will inject securely later via our AWS pipeline, to demonstrate how configurations and secrets are passed to the running container.
 
@@ -69,7 +67,7 @@ Commit and push these files to your GitHub repository's `main` branch.
 
 For AWS to automatically build and deploy your code whenever you push a commit, it needs secure access to your GitHub repository. [AWS CodeConnections](https://docs.aws.amazon.com/dtconsole/latest/userguide/welcome-connections.html) bridges the gap between third-party source providers and AWS services.
 
-By running the command below, we initiate a connection request to GitHub. This establishes the webhook mechanism that will eventually trigger our [AWS CodePipeline](https://aws.amazon.com/codepipeline/). Remember, this command only starts the process; manual authorization in the AWS Console is strictly required to finalize the handshake.
+By running the command below, we initiate a connection request to GitHub. This establishes the webhook mechanism that will eventually trigger our [AWS CodePipeline](https://aws.amazon.com/codepipeline/). However, this command only starts the process; manual authorization in the AWS Console by *a user with admin privileges on the organization the repo belongs* to is strictly required to finalize the handshake.
 
 ```bash
 # Initiates a connection to GitHub that acts as a secure webhook bridge
@@ -124,9 +122,9 @@ aws ecr create-repository --repository-name my-web-app
 aws ecs create-cluster --cluster-name my-app-cluster
 ```
 
-Amazon ECS needs exact instructions on how to run your Docker container. This is done using a Task Definition, which acts like a blueprint for your application's operational requirements.
+Amazon ECS needs exact instructions on how to run your Docker container. This is done using a **Task Definition**, which acts like a blueprint for your application's operational requirements.
 
-Before creating the task definition, we need an IAM role that grants ECS permission to pull container images from ECR and write logs to CloudWatch on behalf of our task. This is called the ECS Task Execution Role.
+Before creating the task definition, we need an IAM role that grants ECS permission to pull container images from ECR and write logs to CloudWatch on behalf of our task. This is called the **ECS Task Execution Role**.
 
 ```bash
 # Create the trust policy that allows ECS to assume this role
@@ -187,7 +185,7 @@ The JSON file below defines critical runtime parameters such as the required CPU
 }
 ```
 
-> *Make sure to replace `<ACCOUNT_ID>` and `<REGION>` with your actual AWS details.*
+> *Make sure to replace `<ACCOUNT_ID>` and `<REGION>` with your actual AWS details, and add the arn for your parameter store and secrets values*
 
 With the task definition ready, we register the JSON blueprint with ECS and create the service with zero running tasks (for now). But first, we need a security group that allows inbound traffic on port 3000 so we can reach our app from the internet.
 
@@ -345,7 +343,7 @@ We will create a private [Amazon S3](https://aws.amazon.com/s3/) bucket dedicate
 aws s3 mb s3://my-pipeline-artifacts-bucket-<YOUR_ACCOUNT_ID>
 ```
 
->S3 bucket names are shared across all accounts so make sure you use an unique name!
+>S3 bucket names are shared across all accounts so make sure you use a unique name!
 
 Now comes the conductor of the orchestra: AWS CodePipeline. To create a pipeline, we define its entire structure—all the stages and actions—in a comprehensive JSON document.
 
@@ -500,8 +498,6 @@ echo "App running at: http://$PUBLIC_IP:3000"
 
 Visit `http://<PUBLIC_IP>:3000` in your browser and you should see the JSON response from your app. From this point on, any subsequent push to `main` will trigger the pipeline and automatically update the running ECS service after approval.
 
-
-
 ![Hello from ECS Fargate](hello-fargate.png)
 
 ## Clean Up Resources
@@ -560,4 +556,8 @@ aws iam delete-role --role-name CodePipelineServiceRole
 
 You've successfully built a fully native AWS CI/CD pipeline! Building directly in AWS with CodePipeline and CodeBuild means you don't have to manage external access keys, your billing is centralized, and your pipeline runs securely within the AWS network.
 
-Interested on building a CI/CD pipeline for your application? [Let's talk!](mailto:hector@hectorzelaya.dev)
+If you prefer an Infrastructure as Code approach, I also wrote a companion guide on [deploying a containerized MVP on ECS Fargate with Terraform and GitHub Actions](https://agilityfeat.com/blog/how-to-deploy-containerized-mvp-on-aws-ecs-fargate-with-terraform-and-github-actions/) that covers private subnets, load balancing, and automatic rollback.
+
+If you're building something similar and want to bounce ideas off someone, feel free to [reach out](mailto:hector@agilityfeat.com) — I'm always happy to talk shop.
+
+Happy building!
