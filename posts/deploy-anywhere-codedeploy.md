@@ -800,3 +800,5 @@ CodeDeploy on EC2 gives you a spectrum of deployment safety:
 The AppSpec file and lifecycle hooks are the same regardless of strategy. The strategy only controls *how many instances update simultaneously* (in-place) or *whether you provision a parallel fleet* (blue/green).
 
 CloudWatch alarms close the loop: if something goes wrong during deployment, CodeDeploy automatically rolls back without human intervention. This is what makes CodeDeploy production-grade — not just orchestration, but automated safety.
+
+If you're working through deployment strategy decisions for your own systems, feel free to [reach out](mailto:hector@agilityfeat.com) — always happy to talk shop.
