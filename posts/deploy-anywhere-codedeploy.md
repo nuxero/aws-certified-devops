@@ -801,4 +801,4 @@ The AppSpec file and lifecycle hooks are the same regardless of strategy. The st
 
 CloudWatch alarms close the loop: if something goes wrong during deployment, CodeDeploy automatically rolls back without human intervention. This is what makes CodeDeploy production-grade — not just orchestration, but automated safety.
 
-If you're working through deployment strategy decisions for your own systems, feel free to [reach out](mailto:hector@agilityfeat.com) — always happy to talk shop.
+If you've hit edge cases with CodeDeploy in production — lifecycle hook timeouts, ASG capacity issues during blue/green, or alarm tuning — drop a comment o [reach out](mailto:hector@agilityfeat.com). I'm curious what others are running into.
