@@ -179,10 +179,10 @@ Where:
 - **`count`** — how many subnet CIDRs to generate (1–256)
 - **`cidrBits`** — the number of host bits per subnet. This is the *inverse* of the subnet mask: for a /24 subnet inside a /16 VPC, you need 8 bits (32 - 24 = 8). For a /20 subnet, you need 12 bits (32 - 20 = 12).
 
-You combine it with `!Select` to pick individual subnets by index, and `!FindInMap` to pull the sizing from our mapping:
+You combine it with `!Select` to pick individual subnets by index, and `!FindInMap` to pull the sizing from our mapping. This is how each subnet's `CidrBlock` property will look in the Resources section below:
 
 ```yaml
-# Derive subnet CIDR using environment-specific sizing from the mapping
+# Inside a subnet resource's Properties block
 CidrBlock: !Select
   - 0
   - !Cidr
@@ -190,6 +190,8 @@ CidrBlock: !Select
     - !FindInMap [NetworkConfig, !Ref Environment, SubnetCount]
     - !FindInMap [NetworkConfig, !Ref Environment, SubnetBits]
 ```
+
+Each subnet uses a different index (0 through 3) to get its own non-overlapping CIDR.
 
 With `SubnetBits: '8'` (dev) and a VPC CIDR of `10.0.0.0/16`, this produces /24 subnets:
 
@@ -1040,24 +1042,32 @@ aws cloudformation describe-change-set \
 Expected output:
 
 ```
----------------------------------------------------
-|              DescribeChangeSet                   |
-+--------+-------------------+--------------------+
-| Action |    LogicalId      |   Replacement      |
-+--------+-------------------+--------------------+
-| Modify |  VPC              |   Never            |
-+--------+-------------------+--------------------+
+-----------------------------------------------------------------
+|                      DescribeChangeSet                         |
++--------+--------------------------------------+---------------+
+| Action |              LogicalId               | Replacement   |
++--------+--------------------------------------+---------------+
+| Modify | PrivateSubnet1                       | Conditional   |
+| Modify | PrivateSubnet1RouteTableAssociation  | Conditional   |
+| Modify | PrivateSubnet2                       | Conditional   |
+| Modify | PrivateSubnet2RouteTableAssociation  | Conditional   |
+| Modify | PublicSubnet1                        | Conditional   |
+| Modify | PublicSubnet1RouteTableAssociation   | Conditional   |
+| Modify | PublicSubnet2                        | Conditional   |
+| Modify | PublicSubnet2RouteTableAssociation   | Conditional   |
+| Modify | VPC                                  | False         |
++--------+--------------------------------------+---------------+
 ```
 
 The `Replacement` field is what matters:
 
 | Value | Meaning | Risk |
 |-------|---------|------|
-| `Never` | In-place update — resource keeps its physical ID | Safe |
-| `Conditionally` | Might require replacement depending on other changes | Review carefully |
+| `False` | In-place update — resource keeps its physical ID | Safe |
+| `Conditional` | Might require replacement depending on whether a dependency is replaced | Review carefully |
 | `True` | Resource will be destroyed and recreated (new physical ID) | Dangerous for stateful resources |
 
-Adding a tag is a `Never` replacement — safe to apply. Execute the change set:
+The VPC shows `False` — adding a tag is an in-place update. The subnets show `Conditional` because they reference `!GetAtt VPC.CidrBlock` — if the VPC *were* replaced, the subnets would need new CIDRs too. Since the VPC itself isn't being replaced here, neither will the subnets. This is safe to apply:
 
 ```bash
 aws cloudformation execute-change-set \
