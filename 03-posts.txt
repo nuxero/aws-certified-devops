@@ -1,7 +1,11 @@
 Post #1 - CloudFormation from Scratch: Building a VPC
 
-Post #2 - Advanced CloudFormation: Cross-Stack and Cross-Account
+Post #2 - Advanced CloudFormation: Cross-Stack References and Nested Stacks
 
-Post #3 - Advanced ClodFormation: Custom Resrouces with Lambda
+Post #3 - CloudFormation StackSets: Multi-Account, Multi-Region Deployment
 
-Post #4 - AWS CDK 101
+Post #4 - CloudFormation Governance & Operations: Drift Detection, Resource Imports, and Keeping Stacks Healthy
+
+Post #5 - Advanced CloudFormation: Custom Resources with Lambda
+
+Post #6 - AWS CDK 101
