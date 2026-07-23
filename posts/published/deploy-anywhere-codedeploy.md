@@ -1,4 +1,4 @@
-# CodeDeploy on EC2: From First Deployment to Blue/Green
+# CodeDeploy on EC2: From First Deployment to Blue/Green - PUBLISHED
 
 Deploying code to production needs to be fast (for delivering value) and safe (for not breaking things). These goals pull in opposite directions, and the gap between them is where deployment automation lives. AWS CodeDeploy is one answer to this problem — a managed service that orchestrates file copying, validation scripts, traffic shifting, and automatic rollback across EC2 instances, on-premises servers, Lambda functions, and ECS services.
 

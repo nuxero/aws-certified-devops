@@ -1,4 +1,4 @@
-# Building a Complete CI/CD Pipeline in AWS: From GitHub to ECS Fargate
+# Building a Complete CI/CD Pipeline in AWS: From GitHub to ECS Fargate - PUBLISHED
 
 If you want to deliver software faster and with fewer bugs, you need a CI/CD pipeline. **CI (Continuous Integration)** automates the process of building and testing your code every time someone commits a change. **CD (Continuous Deployment/Delivery)** automates releasing that validated code to your servers.
 

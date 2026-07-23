@@ -1,8 +1,8 @@
 # Cross-Account ECS Deployments with AWS CodePipeline
 
-In the real world, most organizations don't run everything in a single AWS account. They separate environments — dev, staging, production — into different accounts. This gives you stronger security boundaries, cleaner billing, and limits the blast radius when something goes wrong.
+In the real world, most organizations don't run everything in a single AWS account. They separate concerns — CI/CD tooling in one account, production workloads in another. This gives you stronger security boundaries, cleaner billing, and limits the blast radius when something goes wrong. Your pipeline infrastructure stays isolated from the services it deploys to.
 
-But it introduces a challenge: how does your CI/CD pipeline in one account deploy to another?
+But it introduces a challenge: how does your CI/CD pipeline in a tooling account deploy to a production account?
 
 In this post, we'll take an existing CodePipeline (source + build) in a **Tooling Account** and wire it up to deploy a containerized application to an ECS Fargate service in a separate **Production Account**. We'll cover every piece that makes cross-account deployment work: KMS key sharing, S3 bucket policies, IAM trust relationships, and ECR image access.
 
@@ -589,7 +589,7 @@ Now let's connect them.
 
 ## Step 1: Update the KMS Key Policy
 
-The CloudFormation template already created a KMS key with cross-account decrypt permissions. If you deployed the template exactly as shown, this step is already done. You can check the created key Key Management Service console > cross-account-pipeline-key in Tooling account.
+The CloudFormation template already created a KMS key with cross-account decrypt permissions. If you deployed the template exactly as shown, this step is already done. You can check the created key in the Key Management Service console > cross-account-pipeline-key in the Tooling account.
 
 If you're working with an existing pipeline that uses the default S3 encryption, you need to create a Customer Managed Key and update its policy. Here's what that key policy looks like:
 
@@ -971,7 +971,7 @@ The setup above works, but for production use, tighten things up:
 
 ## Clean Up
 
-To avoid charges, tear down both accounts resources in order.
+To avoid charges, tear down both accounts' resources in order.
 
 **Production Account (Account B):**
 
@@ -1001,7 +1001,6 @@ rm -f cross-account-trust-policy.json cross-account-deploy-policy.json
 # Delete the pipeline first (it may block stack deletion)
 aws codepipeline delete-pipeline --name cross-account-app-pipeline
 
-# Empty and delete the artifact bucket
 # Empty and delete the artifact bucket (versioned — must remove all versions)
 BUCKET_NAME=$(aws cloudformation describe-stacks \
   --stack-name cross-account-pipeline-tooling \
@@ -1039,4 +1038,4 @@ This pattern scales naturally. Need a staging account? Add another role and anot
 
 The hardest part isn't the code — it's getting the IAM trust chain right. When something fails, check the trust policy first. It's almost always the trust policy.
 
-Interested on deploying your application across multiple AWS account? [Let's talk](mailto:hector@hectorzelaya.dev)
+Interested in deploying your application across multiple AWS accounts? [Let's talk](mailto:hector@agilityfeat.com)

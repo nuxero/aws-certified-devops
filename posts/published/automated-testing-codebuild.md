@@ -1,4 +1,4 @@
-# Automated Testing in AWS CodeBuild: Building a Multi-Stage Quality Gate
+# Automated Testing in AWS CodeBuild: Building a Multi-Stage Quality Gate - PUBLISHED
 
 If your tests don't run automatically, they don't exist. That's the uncomfortable truth about software quality. Tests sitting in a `test/` folder that only run when someone remembers to type `npm test` will eventually stop catching bugs — because someone will forget, or skip them "just this once," or merge before they finish.
 

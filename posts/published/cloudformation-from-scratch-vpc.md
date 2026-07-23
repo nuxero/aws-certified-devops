@@ -1,4 +1,4 @@
-# CloudFormation from Scratch: Building a Production-Ready VPC Step by Step
+# CloudFormation from Scratch: Building a Production-Ready VPC Step by Step - PUBLISHED
 
 [CloudFormation](https://aws.amazon.com/cloudformation/) remains the foundation of AWS Infrastructure as Code. [SAM](https://aws.amazon.com/serverless/sam/), [CDK](https://aws.amazon.com/cdk/), and [StackSets](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/what-is-cfnstacksets.html) all generate CloudFormation templates under the hood. When one of those tools produces a cryptic error, you debug it by reading the generated template. When you need to understand what a stack actually does, you read the template. The abstraction leaks, and when it does, you need to understand what's underneath.
 
