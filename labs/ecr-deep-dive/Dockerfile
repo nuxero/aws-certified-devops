@@ -1,3 +1,5 @@
+# Stage 1: Install dependencies (includes dev tools the scanner will flag)
+# Using ECR Public Gallery instead of Docker Hub — no rate limits, AWS-hosted
 FROM public.ecr.aws/docker/library/node:18 AS builder
 
 WORKDIR /app

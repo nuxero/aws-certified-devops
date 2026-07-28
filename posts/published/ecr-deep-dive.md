@@ -53,173 +53,14 @@ Before starting, make sure you have the [AWS CLI v2 installed and configured](ht
 
 You'll also need [Docker installed locally](https://docs.docker.com/get-docker/) if you want to build and push images manually. Alternatively, the CloudFormation template includes a CodeBuild project that handles builds for you.
 
-To keep you focused on ECR's features rather than setup boilerplate, we'll deploy a CloudFormation template that provisions the baseline infrastructure:
+All lab files (CloudFormation template, Dockerfile, buildspec, app code) are in the [companion repository](https://github.com/nuxero/ecr-deep-dive-lab). Clone it to follow along:
 
-**`prerequisites.yaml`**:
-
-```yaml
-AWSTemplateFormatVersion: '2010-09-09'
-Description: >
-  Prerequisites for the ECR deep dive lab.
-  Creates an ECR repository, CodeBuild project, S3 bucket, and IAM roles.
-
-Resources:
-  # ECR repository with security best practices enabled by default
-  ECRRepository:
-    Type: AWS::ECR::Repository
-    Properties:
-      RepositoryName: ecr-deep-dive-app
-      # Scan every image on push for OS-level vulnerabilities
-      ImageScanningConfiguration:
-        ScanOnPush: true
-      # Prevent image tags from being overwritten — enforces build traceability
-      ImageTagMutability: IMMUTABLE
-      # Use AES256 encryption (free, simpler than KMS for learning)
-      EncryptionConfiguration:
-        EncryptionType: AES256
-      # Basic lifecycle policy: expire untagged images after 7 days,
-      # keep only the last 20 tagged images
-      LifecyclePolicy:
-        LifecyclePolicyText: |
-          {
-            "rules": [
-              {
-                "rulePriority": 1,
-                "description": "Expire untagged images after 7 days",
-                "selection": {
-                  "tagStatus": "untagged",
-                  "countType": "sinceImagePushed",
-                  "countUnit": "days",
-                  "countNumber": 7
-                },
-                "action": { "type": "expire" }
-              },
-              {
-                "rulePriority": 2,
-                "description": "Keep only last 20 tagged images",
-                "selection": {
-                  "tagStatus": "tagged",
-                  "tagPrefixList": ["v"],
-                  "countType": "imageCountMoreThan",
-                  "countNumber": 20
-                },
-                "action": { "type": "expire" }
-              }
-            ]
-          }
-
-  # S3 bucket to store the Dockerfile and build context for CodeBuild
-  ArtifactBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: !Sub 'ecr-deep-dive-${AWS::AccountId}'
-      VersioningConfiguration:
-        Status: Enabled
-
-  # IAM role for CodeBuild — allows pushing images to ECR and writing logs
-  CodeBuildServiceRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: ECRDeepDiveCodeBuildRole
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: codebuild.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: ECRDeepDivePolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              # Allow CodeBuild to push and pull images from ECR
-              - Sid: ECRAccess
-                Effect: Allow
-                Action:
-                  - ecr:GetDownloadUrlForLayer
-                  - ecr:BatchGetImage
-                  - ecr:BatchCheckLayerAvailability
-                  - ecr:PutImage
-                  - ecr:InitiateLayerUpload
-                  - ecr:UploadLayerPart
-                  - ecr:CompleteLayerUpload
-                  - ecr:DescribeImageScanFindings
-                  - ecr:StartImageScan
-                  - ecr:DescribeImages
-                Resource: !GetAtt ECRRepository.Arn
-              # ECR login requires registry-level permission
-              - Sid: ECRAuth
-                Effect: Allow
-                Action:
-                  - ecr:GetAuthorizationToken
-                Resource: '*'
-              # Allow writing build logs to CloudWatch
-              - Sid: CloudWatchLogs
-                Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource:
-                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/ecr-deep-dive-build'
-                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/ecr-deep-dive-build:*'
-              # Allow reading build context from S3
-              - Sid: S3Access
-                Effect: Allow
-                Action:
-                  - s3:GetObject
-                  - s3:GetObjectVersion
-                Resource:
-                  - !Sub 'arn:aws:s3:::ecr-deep-dive-${AWS::AccountId}/*'
-              # Allow signing images when managed signing is enabled
-              - Sid: SignerAccess
-                Effect: Allow
-                Action:
-                  - signer:SignPayload
-                Resource: '*'
-
-  # CodeBuild project that builds a Docker image and pushes it to ECR
-  CodeBuildProject:
-    Type: AWS::CodeBuild::Project
-    Properties:
-      Name: ecr-deep-dive-build
-      Description: Builds and pushes a sample Docker image to ECR for scanning demos
-      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
-      Artifacts:
-        Type: NO_ARTIFACTS
-      Environment:
-        Type: LINUX_CONTAINER
-        ComputeType: BUILD_GENERAL1_SMALL
-        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
-        # Privileged mode is required for Docker builds inside CodeBuild
-        PrivilegedMode: true
-        EnvironmentVariables:
-          - Name: REPOSITORY_URI
-            Value: !GetAtt ECRRepository.RepositoryUri
-          - Name: AWS_ACCOUNT_ID
-            Value: !Ref AWS::AccountId
-      Source:
-        Type: S3
-        Location: !Sub 'ecr-deep-dive-${AWS::AccountId}/build-context.zip'
-      TimeoutInMinutes: 15
-
-Outputs:
-  RepositoryUri:
-    Description: ECR repository URI for pushing images
-    Value: !GetAtt ECRRepository.RepositoryUri
-  RepositoryArn:
-    Description: ECR repository ARN
-    Value: !GetAtt ECRRepository.Arn
-  ProjectName:
-    Description: CodeBuild project name
-    Value: !Ref CodeBuildProject
-  BucketName:
-    Description: S3 bucket for build context
-    Value: !Ref ArtifactBucket
+```bash
+git clone https://github.com/nuxero/ecr-deep-dive-lab.git
+cd ecr-deep-dive-lab
 ```
 
-The template creates:
+The [`prerequisites.yaml`](https://github.com/nuxero/ecr-deep-dive-lab/blob/main/prerequisites.yaml) template creates:
 
 | Resource | Type | Purpose |
 |----------|------|---------|
@@ -228,10 +69,51 @@ The template creates:
 | CodeBuildServiceRole | `AWS::IAM::Role` | Grants CodeBuild permission to push to ECR, read from S3, write logs |
 | CodeBuildProject | `AWS::CodeBuild::Project` | Builds Docker images and pushes them to ECR (privileged mode for Docker-in-Docker) |
 
+The ECR repository is configured with security best practices from the start:
+
+```yaml
+ECRRepository:
+  Type: AWS::ECR::Repository
+  Properties:
+    RepositoryName: ecr-deep-dive-app
+    ImageScanningConfiguration:
+      ScanOnPush: true
+    ImageTagMutability: IMMUTABLE
+    EncryptionConfiguration:
+      EncryptionType: AES256
+    LifecyclePolicy:
+      LifecyclePolicyText: |
+        {
+          "rules": [
+            {
+              "rulePriority": 1,
+              "description": "Expire untagged images after 7 days",
+              "selection": {
+                "tagStatus": "untagged",
+                "countType": "sinceImagePushed",
+                "countUnit": "days",
+                "countNumber": 7
+              },
+              "action": { "type": "expire" }
+            },
+            {
+              "rulePriority": 2,
+              "description": "Keep only last 20 tagged images",
+              "selection": {
+                "tagStatus": "tagged",
+                "tagPrefixList": ["v"],
+                "countType": "imageCountMoreThan",
+                "countNumber": 20
+              },
+              "action": { "type": "expire" }
+            }
+          ]
+        }
+```
+
 Deploy the stack. The `--capabilities CAPABILITY_NAMED_IAM` flag is required because the template creates a named IAM role:
 
 ```bash
-# Deploy the prerequisite infrastructure
 aws cloudformation deploy \
   --template-file prerequisites.yaml \
   --stack-name ecr-deep-dive-lab \
@@ -241,156 +123,23 @@ aws cloudformation deploy \
 Once complete, retrieve the outputs — you'll reference these throughout the post:
 
 ```bash
-# Grab stack outputs: repository URI, project name, bucket name
 aws cloudformation describe-stacks \
   --stack-name ecr-deep-dive-lab \
   --query 'Stacks[0].Outputs[*].{Key:OutputKey,Value:OutputValue}' \
   --output table
 ```
 
-Now let's create a sample application to push. This Dockerfile intentionally uses `node:18` (not the latest) from the [ECR Public Gallery](https://gallery.ecr.aws/docker/library/node) so that the vulnerability scan has real CVEs to find — Node 18's Debian base and older OpenSSL/zlib libraries carry dozens of known vulnerabilities. The multi-stage build keeps the final image small while giving us both OS and language-level packages for the scanner to examine:
+### Building and Pushing the Sample Image
 
-**`Dockerfile`**:
+The repo includes a multi-stage [`Dockerfile`](https://github.com/nuxero/ecr-deep-dive-lab/blob/main/Dockerfile) that intentionally uses `node:18` from the [ECR Public Gallery](https://gallery.ecr.aws/docker/library/node) — Node 18's Debian base carries dozens of known vulnerabilities for the scanner to find. The [`buildspec.yml`](https://github.com/nuxero/ecr-deep-dive-lab/blob/main/buildspec.yml) handles building, pushing, and scan-gating (we'll explore the gating logic in detail later).
 
-```dockerfile
-# Stage 1: Install dependencies (includes dev tools the scanner will flag)
-# Using ECR Public Gallery instead of Docker Hub — no rate limits, AWS-hosted
-FROM public.ecr.aws/docker/library/node:18 AS builder
-
-WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci --production
-
-# Stage 2: Production image — slim base with only runtime dependencies
-# node:18-slim still carries OS-level CVEs that ECR basic scanning will detect
-FROM public.ecr.aws/docker/library/node:18-slim
-
-WORKDIR /app
-# Copy only production node_modules from the builder stage
-COPY --from=builder /app/node_modules ./node_modules
-COPY app.js ./
-
-EXPOSE 3000
-
-# Health check so ECS/EKS can monitor container health
-HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
-  CMD wget -qO- http://localhost:3000/health || exit 1
-
-CMD ["node", "app.js"]
-```
-
-Create a minimal application for the container. This is just enough to have a running process with a health endpoint:
-
-**`app.js`**:
-
-```javascript
-const http = require('http');
-
-// Simple HTTP server with a health endpoint for container health checks
-const server = http.createServer((req, res) => {
-  if (req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', version: '1.0.0' }));
-  } else {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('ECR Deep Dive Lab - v1.0.0\n');
-  }
-});
-
-server.listen(3000, () => {
-  console.log('Server running on port 3000');
-});
-```
-
-Create `package.json` for the application:
-
-**`package.json`**:
-
-```json
-{
-  "name": "ecr-deep-dive-app",
-  "version": "1.0.0",
-  "main": "app.js",
-  "scripts": {
-    "start": "node app.js"
-  },
-  "dependencies": {
-    "express": "^4.18.2"
-  }
-}
-```
-
-The buildspec tells CodeBuild how to build the Docker image, tag it with both a version and `latest`, push both tags, then wait for the scan results. The `post_build` phase queries scan findings and fails the build if any CRITICAL vulnerabilities are found — this is the pipeline integration pattern we'll explore in detail later:
-
-**`buildspec.yml`**:
-
-```yaml
-version: 0.2
-
-phases:
-  pre_build:
-    commands:
-      # Authenticate Docker to ECR so we can push images
-      - echo "Logging in to ECR..."
-      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $REPOSITORY_URI
-
-  build:
-    commands:
-      # Build the Docker image using the multi-stage Dockerfile
-      # Tag uses the build number — unique per build, works with immutable tags
-      - echo "Building image with tag v$CODEBUILD_BUILD_NUMBER..."
-      - docker build -t $REPOSITORY_URI:v$CODEBUILD_BUILD_NUMBER .
-
-  post_build:
-    commands:
-      # post_build always runs, even if build fails — guard against pushing a broken image
-      - |
-        if [ "$CODEBUILD_BUILD_SUCCEEDING" != "1" ]; then
-          echo "Build failed — skipping push"
-          exit 1
-        fi
-      # Push the tagged image to ECR — this triggers scan-on-push
-      - echo "Pushing image to ECR..."
-      - docker push $REPOSITORY_URI:v$CODEBUILD_BUILD_NUMBER
-      # Trigger a scan and wait for results
-      - echo "Scanning image for vulnerabilities..."
-      - |
-        # Explicitly trigger a scan — more reliable than relying on scan-on-push timing
-        aws ecr start-image-scan \
-          --repository-name ecr-deep-dive-app \
-          --image-id imageTag=v$CODEBUILD_BUILD_NUMBER || true
-
-        # Wait for the scan to finish — polls every 5s, up to 5 minutes
-        aws ecr wait image-scan-complete \
-          --repository-name ecr-deep-dive-app \
-          --image-id imageTag=v$CODEBUILD_BUILD_NUMBER
-
-        # Query the CRITICAL finding count
-        # --output text returns "None" when the key doesn't exist (no CRITICAL findings)
-        CRITICAL=$(aws ecr describe-image-scan-findings \
-          --repository-name ecr-deep-dive-app \
-          --image-id imageTag=v$CODEBUILD_BUILD_NUMBER \
-          --query 'imageScanFindings.findingSeverityCounts.CRITICAL' \
-          --output text)
-
-        if [ "$CRITICAL" = "None" ] || [ -z "$CRITICAL" ]; then
-          CRITICAL=0
-        fi
-
-        echo "Critical vulnerabilities found: $CRITICAL"
-        if [ "$CRITICAL" -gt 0 ]; then
-          echo "CRITICAL vulnerabilities detected — failing build"
-          exit 1
-        fi
-```
-
-Package these files and upload them to S3 so CodeBuild can use them as source. The zip contains everything CodeBuild needs to build the Docker image:
+Package the files and upload them to S3 so CodeBuild can use them as source:
 
 ```bash
-# Create a build context zip containing all project files
+# Create a build context zip and upload to S3
+npm install
 zip build-context.zip Dockerfile app.js package.json package-lock.json buildspec.yml
 
-# Upload to the S3 bucket created by the stack
 BUCKET=$(aws cloudformation describe-stacks \
   --stack-name ecr-deep-dive-lab \
   --query 'Stacks[0].Outputs[?OutputKey==`BucketName`].OutputValue' \
@@ -402,7 +151,6 @@ aws s3 cp build-context.zip s3://$BUCKET/build-context.zip
 Trigger a build to push your first image:
 
 ```bash
-# Start the CodeBuild project — it will build and push the image to ECR
 BUILD_ID=$(aws codebuild start-build \
   --project-name ecr-deep-dive-build \
   --query 'build.id' --output text)
@@ -531,13 +279,11 @@ echo "Scan passed — no critical vulnerabilities"
 
 ### Alternative Approaches
 
-The pattern above (push → scan → gate in the same build) is the simplest AWS-native approach. In production, teams commonly use one of these alternatives:
+- **Scan before push with Trivy or Grype** — fastest feedback, no async timing issues, but requires a third-party tool in your build environment.
+- **Event-driven gate with EventBridge + Lambda** — fully decoupled from the build; a Lambda evaluates findings on the `ECR Image Scan` completion event and approves or quarantines.
+- **CodePipeline InspectorScan action** — native pipeline stage for scanning source code and container SBOMs without embedding logic in the buildspec.
 
-- **Scan before push with Trivy or Grype** — run a local scanner during the build phase, before the image ever reaches ECR. Fastest feedback loop, no async timing issues, catches both OS and language vulnerabilities regardless of ECR scanning mode. The downside: requires installing a third-party tool in your build environment.
-- **Event-driven gate with EventBridge + Lambda** — push the image, let scan-on-push fire asynchronously, and use an EventBridge rule to catch the `ECR Image Scan` completion event. A Lambda evaluates findings and either approves the next pipeline stage or quarantines the image. More infrastructure to manage, but fully decoupled — the build finishes fast and the gate is handled externally.
-- **CodePipeline InspectorScan action** — CodePipeline has a native `InspectorScan` action type that scans source code and container SBOMs as a pipeline stage. Useful if you want scanning as a discrete pipeline stage rather than embedded in the build.
-
-Each approach has trade-offs between simplicity, speed, and coverage. For this post, we use the explicit `start-image-scan` + waiter pattern because it demonstrates ECR's built-in capabilities without external tooling or extra infrastructure.
+For this post, we use the explicit `start-image-scan` + waiter pattern because it demonstrates ECR's built-in capabilities without external tooling.
 
 ## Lifecycle Policies — Automated Image Cleanup
 
@@ -727,11 +473,11 @@ aws ecr put-image-tag-mutability \
 
 ### When to Keep Mutability ON (Immutable = False)
 
-Before exceptions existed, you had to keep entire repos mutable if you needed any overwritable tag. Now that exceptions exist, most of those cases are covered. But there are still scenarios where full mutability makes sense:
+Full mutability still makes sense for:
 
-- **Development/scratch repositories** where images are rebuilt constantly with the same tag during iteration (e.g., `feature-xyz` tag overwritten 50 times a day). The exception list would be too long and change too often.
-- **Repositories where the exception list would be unpredictable** — dozens of dynamic environment tags generated by CI that you can't enumerate in advance.
-- **Pull-through cache repositories** — cached images may need tag updates when the upstream publishes a new image under the same tag. Immutability would block the cache sync.
+- **Development/scratch repositories** where images are rebuilt constantly with the same tag during iteration
+- **Repositories where exceptions would be unpredictable** — dozens of dynamic environment tags generated by CI
+- **Pull-through cache repositories** — cached images may need tag updates when the upstream publishes under the same tag
 
 **Rule of thumb:** if the repository holds anything that goes to staging or production, use immutable + exceptions. If it's purely ephemeral development work, mutable is fine.
 
@@ -857,16 +603,7 @@ Signing is only useful if you verify. The typical verification points:
 
 ### Managed vs. Manual Signing
 
-Before managed signing launched, you had to install Notation locally, configure the AWS Signer plugin, manually sign after each push, and manage signing profiles. Managed signing eliminates all of this — it happens automatically on push, centrally governed as a registry configuration.
-
-| Aspect | Manual (Notation + Signer) | Managed |
-|--------|---------------------------|---------|
-| Client tooling required | Yes (Notation CLI + plugin) | No |
-| When signing happens | After push (manual step) | On push (automatic) |
-| Configuration scope | Per-developer or per-pipeline | Registry-level (centralized) |
-| Signing profile management | Manual | Automatic |
-
-Managed signing is the recommended approach for most teams. Use manual signing only if you need to sign images in registries other than ECR, or if you need custom signing logic.
+Before managed signing, you had to install Notation locally, configure the AWS Signer plugin, and manually sign after each push. Managed signing eliminates all of this — it happens automatically on push, centrally governed as a registry configuration. Use manual signing only if you need to sign images in registries other than ECR or need custom signing logic.
 
 > **The big picture:** Image signing proves provenance (who built this image and was it tampered with). It complements scanning (which proves the image is safe from known vulnerabilities). Together they form the supply chain security story: build → scan → sign → verify at deploy.
 
@@ -880,12 +617,11 @@ Replication solves two problems:
 ### How Replication Works
 
 Replication is configured at the **registry level** (not per-repository) via `put-replication-configuration`. Key behaviors:
-
 - Replication is near-real-time — images typically replicate within seconds of push
 - **Only images pushed after replication is configured are replicated** — existing images are NOT backfilled
 - Repositories are auto-created in the destination if they don't exist
 - You can filter which repositories get replicated using prefix matching
-- A single registry can have up to 10 replication rules with up to 25 destinations each
+- A single registry can have up to 10 replication rules with up to 25 destinations
 
 ```mermaid
 flowchart LR
@@ -1049,113 +785,56 @@ flowchart TD
     style PULL fill:#36f,color:#fff
 ```
 
-The flow:
+The flow: CodeBuild builds and pushes to ECR, which triggers both scan-on-push and managed signing in parallel. The `post_build` phase queries scan results and fails the build if CRITICAL vulnerabilities exist — blocking the deploy stage. If clean, replication distributes the image to production regions/accounts (near-real-time), and ECS/EKS pulls from the local region. Lifecycle policies run every 24 hours in the background, cleaning up old images and archiving stale ones.
 
-1. **CodeBuild** builds the Docker image and pushes to ECR
-2. **Scan-on-push** triggers automatically — Inspector analyzes the image for vulnerabilities
-3. **Managed signing** generates a cryptographic signature on push — no extra step needed
-4. **CodeBuild's post_build phase** queries scan results and fails the build if CRITICAL vulnerabilities exist
-5. **If clean**, the pipeline proceeds to the deploy stage
-6. **Replication** automatically distributes the image to production regions/accounts (near-real-time)
-7. **ECS/EKS** in production pulls from its local region's ECR — low latency, no cross-region dependency at runtime
-8. **Lifecycle policies** run every 24 hours, cleaning up old dev images and archiving stale ones
+Meanwhile, **pull-through cache** ensures that base images your Dockerfile references are cached locally — so builds don't depend on Docker Hub being available.
 
-Meanwhile, **pull-through cache** ensures that any base images your Dockerfile references (like `node:18-slim` from Docker Hub) are cached locally — so your builds don't depend on Docker Hub being available.
-
-This is the complete picture: ECR handles security (scan + sign), distribution (replicate), cost management (lifecycle), and reliability (pull-through cache) — all without external tooling.
+This is the complete picture: ECR handles security (scan + sign), distribution (replicate), cost management (lifecycle), and reliability (pull-through cache) — without external tooling.
 
 ## Clean Up
 
-Remove everything in reverse order. Registry-level settings must be cleaned up before deleting the stack, since CloudFormation doesn't manage them.
-
-First, remove registry-level configurations. These were set up manually outside the CloudFormation stack:
+Remove everything in reverse order. Registry-level settings must be cleaned up before deleting the stack, since CloudFormation doesn't manage them:
 
 ```bash
-# Remove managed signing configuration
-aws ecr delete-signing-configuration
+# 1. Remove registry-level configurations (signing, replication, pull-through cache)
+aws ecr delete-signing-configuration 2>/dev/null
+aws signer cancel-signing-profile --profile-name ecr_image_signing 2>/dev/null
+aws ecr put-replication-configuration --replication-configuration '{"rules": []}'
+aws ecr put-replication-configuration --replication-configuration '{"rules": []}' --region eu-west-1 2>/dev/null
+aws ecr delete-repository --repository-name ecr-deep-dive-app --region eu-west-1 --force 2>/dev/null
 
-# Delete the AWS Signer signing profile
-aws signer cancel-signing-profile --profile-name ecr_image_signing
-
-# Remove replication configuration (set to empty rules)
-aws ecr put-replication-configuration \
-  --replication-configuration '{"rules": []}'
-
-# Remove replication config from destination region if cross-region was set up
-aws ecr put-replication-configuration \
-  --replication-configuration '{"rules": []}' \
-  --region eu-west-1
-
-# Delete the replicated repository in the destination region
-aws ecr delete-repository \
-  --repository-name ecr-deep-dive-app \
-  --region eu-west-1 \
-  --force 2>/dev/null
-
-# If cross-account replication was set up, delete the repo in the target account
-# (run this in the destination account)
-aws ecr delete-repository --repository-name ecr-deep-dive-app --force
-```
-
-Remove pull-through cache rules and any auto-created repositories:
-
-```bash
-# Delete pull-through cache rules
-aws ecr delete-pull-through-cache-rule --ecr-repository-prefix ecr-public
+# 2. Remove pull-through cache rules and auto-created repositories
+aws ecr delete-pull-through-cache-rule --ecr-repository-prefix ecr-public 2>/dev/null
 aws ecr delete-pull-through-cache-rule --ecr-repository-prefix docker-hub 2>/dev/null
-
-# Delete any auto-created pull-through cache repositories
 aws ecr delete-repository --repository-name ecr-public/nginx/nginx --force 2>/dev/null
-```
 
-If you set up cross-account replication, remove the registry policy in the destination account:
+# 3. Remove registry policy and secrets (if cross-account or Docker Hub cache was set up)
+aws ecr delete-registry-policy 2>/dev/null
+aws secretsmanager delete-secret --secret-id ecr-pullthroughcache/docker-hub --force-delete-without-recovery 2>/dev/null
 
-```bash
-# In the destination (production) account: remove the registry permissions policy
-aws ecr delete-registry-policy
-```
-
-Delete the Secrets Manager secret if you set up the Docker Hub pull-through cache:
-
-```bash
-# Only needed if you created the Docker Hub cache rule
-aws secretsmanager delete-secret \
-  --secret-id ecr-pullthroughcache/docker-hub \
-  --force-delete-without-recovery 2>/dev/null
-```
-
-Finally, delete the CloudFormation stack. Empty the S3 bucket first since CloudFormation cannot delete non-empty buckets:
-
-```bash
-# Get the bucket name from stack outputs
+# 4. Empty the S3 bucket (required before CloudFormation can delete it)
 BUCKET=$(aws cloudformation describe-stacks \
   --stack-name ecr-deep-dive-lab \
   --query 'Stacks[0].Outputs[?OutputKey==`BucketName`].OutputValue' \
   --output text)
 
-# Delete all object versions and delete markers (required for versioned buckets)
 aws s3api list-object-versions --bucket $BUCKET --output json \
   | jq '{Objects: [.Versions[]?, .DeleteMarkers[]? | {Key, VersionId}]}' \
   | aws s3api delete-objects --bucket $BUCKET --delete file:///dev/stdin
 
-# Delete all images from the ECR repository (CloudFormation can't delete non-empty repos)
+# 5. Force-delete ECR repo and delete the CloudFormation stack
 aws ecr delete-repository --repository-name ecr-deep-dive-app --force
-
-# Delete the CloudFormation stack (ECR repo, CodeBuild project, IAM role, S3 bucket)
 aws cloudformation delete-stack --stack-name ecr-deep-dive-lab
-
-# Wait for deletion to complete
 aws cloudformation wait stack-delete-complete --stack-name ecr-deep-dive-lab
 ```
 
 ## Conclusion
 
-ECR is a full container lifecycle management platform — not just storage. The features covered in this post break into two categories:
+ECR is a full container lifecycle management platform — not just storage. The features covered here break into two categories:
 
 **Security:** vulnerability scanning catches CVEs before deployment (basic for free, enhanced for depth). Image signing proves provenance. Tag immutability prevents tampering. Together they form a verifiable supply chain: build → scan → sign → verify.
+**Operations:** lifecycle policies control storage costs automatically. Pull-through cache eliminates external registry dependencies. Replication distributes images globally with near-zero latency at pull time. These features require minimal setup but prevent real incidents — registry outages, ballooning costs, slow deployments in distant regions.
 
-**Operations:** lifecycle policies control storage costs automatically. Pull-through cache eliminates external registry dependencies. Replication distributes images globally with near-zero latency at pull time. These features require minimal setup but prevent real production incidents — registry outages, ballooning costs, slow deployments in distant regions.
+The key architectural insight: most ECR features are configured at the **registry level**, not per-repository. Scanning, replication, pull-through cache, and signing are registry-wide settings. Only lifecycle policies and tag immutability are per-repository. Set them up once and every new repository benefits automatically.
 
-The key architectural insight: most ECR features are configured at the **registry level**, not per-repository. Scanning, replication, pull-through cache, and signing are all registry-wide settings. Only lifecycle policies and tag immutability are per-repository. This means you set them up once and every new repository benefits automatically.
-
-Interested on taking advantage of ECR features for your containerized application? [Let's talk!](mailto:hector@hectorzelaya.dev)
+Interested in taking advantage of ECR features for your containerized application? [Let's talk!](mailto:hector@agilityfeat.com)
