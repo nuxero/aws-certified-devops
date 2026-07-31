@@ -1,0 +1,5 @@
+.direnv/
+node_modules/
+*.tfstate
+*.tfstate.backup
+.terraform/

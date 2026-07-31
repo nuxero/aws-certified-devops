@@ -1,10 +1,10 @@
-# ECS Deployment Strategies: CodeDeploy Blue/Green vs. Native Canary and Linear
+# ECS Deployment Strategies: CodeDeploy Blue/Green vs. Native Blue/Green, Canary, and Linear
 
-ECS offers three deployment strategies. 
+You're running a production service on ECS and need safe deployments — the ability to validate a new version before real users see it, and instant rollback if something goes wrong. ECS offers three deployment strategies, each with a different trade-off between simplicity and safety:
 
 * The **rolling update** is the default — ECS launches new tasks, waits for health checks, then drains old ones. Simple, but it provides no instant rollback and no test traffic validation. 
 * **CodeDeploy blue/green** is the original advanced option — full lifecycle hooks, a test listener for pre-production validation, and alarm-based rollback. It works, but requires setting up a separate CodeDeploy application, deployment group, AppSpec file, and service role. 
-* **ECS-native blue/green** provides the same capabilities — Lambda lifecycle hooks, test listeners, canary/linear traffic shifting — with significantly less configuration and tighter ECS integration.
+* **ECS-native blue/green** (launched July 2025) provides the same capabilities — Lambda lifecycle hooks, test listeners, canary/linear traffic shifting — with significantly less configuration and tighter ECS integration.
 
 This post deploys the same application using both CodeDeploy and ECS-native approaches, compares the mechanics, and provides a decision framework for choosing between them.
 
@@ -15,6 +15,13 @@ To follow along, you'll need:
 - [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) configured with credentials that have permissions for ECS, EC2, ELB, IAM, CodeDeploy, CloudWatch, and Lambda
 - An AWS account — estimated cost is ~$1–2 USD (Fargate tasks running for a few hours, ALB)
 - A VPC with at least two public subnets in different Availability Zones (the default VPC works)
+
+All lab files (CloudFormation templates, task definitions) are in the [companion repository](https://github.com/nuxero/ecs-deployment-strategies-lab). Clone it to follow along:
+
+```bash
+git clone https://github.com/nuxero/ecs-deployment-strategies-lab.git
+cd ecs-deployment-strategies-lab
+```
 
 ## ECS Deployment Concepts
 
@@ -61,172 +68,20 @@ During deployment, the test listener routes to the green task set. After validat
 
 This template provisions the full infrastructure: an ECS Fargate service running a simple web application that returns "Hello World v1", an ALB with two target groups and two listeners (production on port 80, test on port 8080), and all CodeDeploy resources including a lifecycle hook Lambda function.
 
-**`ecs-codedeploy-prerequisites.yaml`**:
+The key resources and their purpose:
+
+| Resource | Purpose |
+|----------|---------|
+| ECS Cluster + Service | Fargate service with `CODE_DEPLOY` deployment controller |
+| ALB + 2 Target Groups | Blue/green traffic switching via production and test listeners |
+| CodeDeploy Application + Deployment Group | Manages blue/green lifecycle and traffic shifting |
+| Lambda Function | `AfterAllowTestTraffic` hook that validates the green task set via the test listener |
+
+**[`ecs-codedeploy-prerequisites.yaml`](https://github.com/nuxero/ecs-deployment-strategies-lab/blob/main/ecs-codedeploy-prerequisites.yaml)**:
+
+The full template is in the companion repo. Here are the key sections that make it a CodeDeploy blue/green deployment — the parts that differ from a standard ECS service:
 
 ```yaml
-AWSTemplateFormatVersion: '2010-09-09'
-Description: >
-  ECS CodeDeploy blue/green lab. Creates Fargate service with ALB,
-  two target groups, test listener, CodeDeploy application and deployment group.
-
-Parameters:
-  VpcId:
-    Type: AWS::EC2::VPC::Id
-  SubnetIds:
-    Type: List<AWS::EC2::Subnet::Id>
-    Description: At least two public subnets
-
-Resources:
-  # ECS Cluster
-  Cluster:
-    Type: AWS::ECS::Cluster
-    Properties:
-      ClusterName: ecs-deploy-lab
-
-  # Task execution role — allows ECS to pull images and write logs
-  TaskExecutionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: ecs-deploy-lab-execution-role
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: ecs-tasks.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
-
-  # Security groups
-  ALBSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: ALB - allow HTTP on port 80 and 8080
-      VpcId: !Ref VpcId
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 80
-          ToPort: 80
-          CidrIp: 0.0.0.0/0
-        - IpProtocol: tcp
-          FromPort: 8080
-          ToPort: 8080
-          CidrIp: 0.0.0.0/0
-
-  TaskSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: ECS tasks - allow HTTP from ALB
-      VpcId: !Ref VpcId
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 80
-          ToPort: 80
-          SourceSecurityGroupId: !Ref ALBSecurityGroup
-
-  # Application Load Balancer
-  ALB:
-    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
-    Properties:
-      Name: ecs-deploy-lab-alb
-      Subnets: !Ref SubnetIds
-      SecurityGroups: [!Ref ALBSecurityGroup]
-
-  # Two target groups — blue (initial) and green (replacement during deployment)
-  BlueTargetGroup:
-    Type: AWS::ElasticLoadBalancingV2::TargetGroup
-    Properties:
-      Name: ecs-deploy-lab-blue
-      Port: 80
-      Protocol: HTTP
-      VpcId: !Ref VpcId
-      TargetType: ip
-      HealthCheckPath: /
-      HealthCheckIntervalSeconds: 5
-      HealthyThresholdCount: 2
-      UnhealthyThresholdCount: 2
-      HealthCheckTimeoutSeconds: 3
-
-  GreenTargetGroup:
-    Type: AWS::ElasticLoadBalancingV2::TargetGroup
-    Properties:
-      Name: ecs-deploy-lab-green
-      Port: 80
-      Protocol: HTTP
-      VpcId: !Ref VpcId
-      TargetType: ip
-      HealthCheckPath: /
-      HealthCheckIntervalSeconds: 5
-      HealthyThresholdCount: 2
-      UnhealthyThresholdCount: 2
-      HealthCheckTimeoutSeconds: 3
-
-  # Production listener — port 80, routes to blue target group
-  ProductionListener:
-    Type: AWS::ElasticLoadBalancingV2::Listener
-    Properties:
-      LoadBalancerArn: !Ref ALB
-      Port: 80
-      Protocol: HTTP
-      DefaultActions:
-        - Type: forward
-          TargetGroupArn: !Ref BlueTargetGroup
-
-  # Test listener — port 8080, initially points to blue (CodeDeploy switches it to green during deployment)
-  TestListener:
-    Type: AWS::ElasticLoadBalancingV2::Listener
-    Properties:
-      LoadBalancerArn: !Ref ALB
-      Port: 8080
-      Protocol: HTTP
-      DefaultActions:
-        - Type: forward
-          TargetGroupArn: !Ref BlueTargetGroup
-
-  # Task definition — simple Node.js HTTP server returning "Hello World v1"
-  TaskDefinition:
-    Type: AWS::ECS::TaskDefinition
-    Properties:
-      Family: ecs-deploy-lab
-      Cpu: '256'
-      Memory: '512'
-      NetworkMode: awsvpc
-      RequiresCompatibilities: [FARGATE]
-      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
-      ContainerDefinitions:
-        - Name: app
-          Image: public.ecr.aws/docker/library/node:20-alpine
-          # Inline HTTP server — returns the version from APP_VERSION env var
-          Command:
-            - node
-            - -e
-            - |
-              const http = require('http');
-              const version = process.env.APP_VERSION || '1';
-              http.createServer((req, res) => {
-                res.writeHead(200, {'Content-Type': 'text/plain'});
-                res.end(`Hello World v${version}\n`);
-              }).listen(80);
-          Environment:
-            - Name: APP_VERSION
-              Value: '1'
-          PortMappings:
-            - ContainerPort: 80
-          Essential: true
-          LogConfiguration:
-            LogDriver: awslogs
-            Options:
-              awslogs-group: !Ref LogGroup
-              awslogs-region: !Ref AWS::Region
-              awslogs-stream-prefix: ecs
-
-  LogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: /ecs/deploy-lab
-      RetentionInDays: 7
-
   # ECS Service — deployment controller set to CODE_DEPLOY
   Service:
     Type: AWS::ECS::Service
@@ -250,28 +105,6 @@ Resources:
           ContainerPort: 80
           TargetGroupArn: !Ref BlueTargetGroup
 
-  # CodeDeploy service role — allows CodeDeploy to manipulate ECS services and ALB
-  CodeDeployServiceRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: ecs-deploy-lab-codedeploy-role
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: codedeploy.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS
-
-  # CodeDeploy application — compute platform ECS
-  CodeDeployApplication:
-    Type: AWS::CodeDeploy::Application
-    Properties:
-      ApplicationName: ecs-deploy-lab
-      ComputePlatform: ECS
-
   # CodeDeploy deployment group — wires together service, target groups, listeners
   DeploymentGroup:
     Type: AWS::CodeDeploy::DeploymentGroup
@@ -280,11 +113,9 @@ Resources:
       DeploymentGroupName: ecs-deploy-lab-dg
       ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
       DeploymentConfigName: CodeDeployDefault.ECSAllAtOnce
-      # Blue/green deployment style
       DeploymentStyle:
         DeploymentType: BLUE_GREEN
         DeploymentOption: WITH_TRAFFIC_CONTROL
-      # Wire up ECS service + target groups + listeners
       ECSServices:
         - ClusterName: !Ref Cluster
           ServiceName: !GetAtt Service.Name
@@ -307,99 +138,38 @@ Resources:
         DeploymentReadyOption:
           ActionOnTimeout: CONTINUE_DEPLOYMENT
           WaitTimeInMinutes: 0
+```
 
-  # Lambda hook function role
-  HookFunctionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: ecs-deploy-lab-hook-role
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: CodeDeployHookPermissions
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: codedeploy:PutLifecycleEventHookExecutionStatus
-                Resource: '*'
+The template also includes a Lambda function (`CodeDeployHook_ecs-deploy-lab-test-traffic`) that acts as the `AfterAllowTestTraffic` hook. It hits the test listener URL and reports success or failure back to CodeDeploy:
 
-  # AfterAllowTestTraffic hook — validates the green task set via test listener
-  TestTrafficHook:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: CodeDeployHook_ecs-deploy-lab-test-traffic
-      Runtime: nodejs20.x
-      Handler: index.handler
-      Role: !GetAtt HookFunctionRole.Arn
-      Timeout: 30
-      Environment:
-        Variables:
-          TEST_URL: !Sub 'http://${ALB.DNSName}:8080'
-      Code:
-        ZipFile: |
-          const { CodeDeployClient, PutLifecycleEventHookExecutionStatusCommand } = require("@aws-sdk/client-codedeploy");
-          const codedeploy = new CodeDeployClient();
+```javascript
+// AfterAllowTestTraffic hook — validates the green task set via test listener
+exports.handler = async (event) => {
+  const deploymentId = event.DeploymentId;
+  const lifecycleEventHookExecutionId = event.LifecycleEventHookExecutionId;
+  let status = "Failed";
 
-          exports.handler = async (event) => {
-            const deploymentId = event.DeploymentId;
-            const lifecycleEventHookExecutionId = event.LifecycleEventHookExecutionId;
-            let status = "Failed";
+  try {
+    // Wait for ALB to finish routing test listener to green target group
+    await new Promise(resolve => setTimeout(resolve, 10000));
 
-            try {
-              // Wait for the ALB test listener to finish switching to the green target group.
-              // CodeDeploy fires this hook immediately after initiating the switch, but the
-              // ALB needs a few seconds to complete the routing change.
-              await new Promise(resolve => setTimeout(resolve, 10000));
+    // Hit the test listener to validate the green task set
+    const response = await fetch(process.env.TEST_URL);
+    const body = await response.text();
+    if (response.ok) {
+      console.log("Test traffic validation passed — HTTP", response.status);
+      console.log("Response from green task set:", body.trim());
+      status = "Succeeded";
+    }
+  } catch (err) {
+    console.error("Test traffic validation error:", err);
+  }
 
-              // Hit the test listener to validate the green task set
-              const response = await fetch(process.env.TEST_URL);
-              const body = await response.text();
-              if (response.ok) {
-                console.log("Test traffic validation passed — HTTP", response.status);
-                console.log("Response from green task set:", body.trim());
-                status = "Succeeded";
-              } else {
-                console.error("Test traffic validation failed — HTTP", response.status, body);
-              }
-            } catch (err) {
-              console.error("Test traffic validation error:", err);
-            }
-
-            // Report result to CodeDeploy
-            await codedeploy.send(new PutLifecycleEventHookExecutionStatusCommand({
-              deploymentId,
-              lifecycleEventHookExecutionId,
-              status,
-            }));
-
-            return { statusCode: 200, body: status };
-          };
-
-Outputs:
-  ALBDns:
-    Description: ALB DNS — use to verify deployments
-    Value: !GetAtt ALB.DNSName
-  TestListenerUrl:
-    Description: Test listener URL (port 8080)
-    Value: !Sub 'http://${ALB.DNSName}:8080'
-  ClusterName:
-    Value: !Ref Cluster
-  ServiceName:
-    Value: !GetAtt Service.Name
-  TaskDefinitionArn:
-    Value: !Ref TaskDefinition
-  CodeDeployApp:
-    Value: !Ref CodeDeployApplication
-  DeploymentGroup:
-    Value: !Ref DeploymentGroup
+  // Report result to CodeDeploy
+  await codedeploy.send(new PutLifecycleEventHookExecutionStatusCommand({
+    deploymentId, lifecycleEventHookExecutionId, status,
+  }));
+};
 ```
 
 Deploy the stack and wait for the service to stabilize:
@@ -431,41 +201,7 @@ To trigger a blue/green deployment, register a new task definition revision and 
 
 > **Note:** In a real project, deploying a new version means building a Docker image, pushing it to Docker registry (i.e. ECR, DockerHub, etc), and updating the `image` field in the task definition. This lab uses an inline `node -e` command with an environment variable to simulate version changes without requiring a Docker build workflow — keeping the focus on deployment mechanics.
 
-**`task-definition-v2.json`**:
-
-```json
-{
-  "family": "ecs-deploy-lab",
-  "cpu": "256",
-  "memory": "512",
-  "networkMode": "awsvpc",
-  "requiresCompatibilities": ["FARGATE"],
-  "executionRoleArn": "<EXECUTION_ROLE_ARN>",
-  "containerDefinitions": [
-    {
-      "name": "app",
-      "image": "public.ecr.aws/docker/library/node:20-alpine",
-      "command": [
-        "node", "-e",
-        "const http = require('http'); const version = process.env.APP_VERSION || '1'; http.createServer((req, res) => { res.writeHead(200, {'Content-Type': 'text/plain'}); res.end(`Hello World v${version}\\n`); }).listen(80);"
-      ],
-      "environment": [
-        { "name": "APP_VERSION", "value": "2" }
-      ],
-      "portMappings": [{ "containerPort": 80 }],
-      "essential": true,
-      "logConfiguration": {
-        "logDriver": "awslogs",
-        "options": {
-          "awslogs-group": "/ecs/deploy-lab",
-          "awslogs-region": "us-east-1",
-          "awslogs-stream-prefix": "ecs"
-        }
-      }
-    }
-  ]
-}
-```
+**[`task-definition-v2.json`](https://github.com/nuxero/ecs-deployment-strategies-lab/blob/main/codedeploy/task-definition-v2.json)** — identical to v1 except `APP_VERSION` changes from `"1"` to `"2"`. Grab it from the companion repo (`codedeploy/task-definition-v2.json`).
 
 Fill in the execution role ARN and register it:
 
@@ -574,7 +310,7 @@ The deployment sequence:
 5. Hook reports `Succeeded` → production listener (port 80) shifts to green
 6. 5-minute termination wait → blue task set terminates
 
-> **Note:** In our testing, the ALB listener switch (step 3) takes a few seconds to propagate before traffic actually routes to the new target group. CodeDeploy marks the switch as complete and fires the hook immediately, but the ALB hasn't finished routing yet. This is a [known ALB behavior](https://repost.aws/questions/QU83vc4Oc-QPCu04XEAOzN7Q/application-load-balancer-504-errors-with-weighted-target-group) — changes take a few seconds to propagate. The hook includes a 10-second wait to account for this. In production hooks running full test suites, the setup time before the first HTTP request should naturally covers this delay.
+> **Note:** In our testing, the ALB listener switch (step 3) takes a few seconds to propagate before traffic actually routes to the new target group. CodeDeploy marks the switch as complete and fires the hook immediately, but the ALB hasn't finished routing yet. This is a [known ALB behavior](https://repost.aws/questions/QU83vc4Oc-QPCu04XEAOzN7Q/application-load-balancer-504-errors-with-weighted-target-group) — changes take a few seconds to propagate. The hook includes a 10-second wait to account for this. In production hooks running full test suites, the setup time before the first HTTP request should naturally cover this delay.
 
 ### Traffic Shifting Options with CodeDeploy
 
@@ -605,6 +341,8 @@ You can attach CloudWatch alarms to the deployment group (via `alarm-configurati
 Two rollback triggers exist: `DEPLOYMENT_FAILURE` (hook reports failed, tasks won't start) and `DEPLOYMENT_STOP_ON_ALARM` (CloudWatch alarm fires during deployment). Both result in the same outcome — production traffic reverts to blue.
 
 ## Approach 2 — ECS Native Blue/Green
+
+CodeDeploy blue/green works — but as you saw, it requires a CodeDeploy application, deployment group, service role, AppSpec file, and Lambda hooks wired together through CodeDeploy's own lifecycle. What if ECS could handle all of this natively?
 
 ### How It Differs from CodeDeploy
 
@@ -653,168 +391,13 @@ No separate CodeDeploy application, deployment group, or service role required.
 
 ### Prerequisites — CloudFormation Template (Native)
 
-This template provisions the infrastructure: cluster, ALB with two target groups and two listeners, and a basic ECS service using the default rolling update strategy. We'll upgrade it to blue/green via CLI in the next step.
+This template provisions the same base infrastructure (cluster, ALB, two target groups, two listeners) but without any CodeDeploy resources. The service starts with a rolling update strategy — we'll upgrade it to blue/green via CLI in the next step.
 
-**`ecs-native-prerequisites.yaml`**:
+**[`ecs-native-prerequisites.yaml`](https://github.com/nuxero/ecs-deployment-strategies-lab/blob/main/ecs-native-prerequisites.yaml)**:
+
+The full template is in the companion repo. Here are the key resources that differ from the CodeDeploy approach:
 
 ```yaml
-AWSTemplateFormatVersion: '2010-09-09'
-Description: >
-  ECS native blue/green lab. Creates Fargate service with ALB and
-  two target groups. Service starts with rolling update — upgraded to blue/green via CLI.
-
-Parameters:
-  VpcId:
-    Type: AWS::EC2::VPC::Id
-  SubnetIds:
-    Type: List<AWS::EC2::Subnet::Id>
-    Description: At least two public subnets
-
-Resources:
-  Cluster:
-    Type: AWS::ECS::Cluster
-    Properties:
-      ClusterName: ecs-native-deploy-lab
-
-  TaskExecutionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: ecs-native-deploy-lab-execution-role
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: ecs-tasks.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
-
-  ALBSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: ALB - allow HTTP on port 80 and 8080
-      VpcId: !Ref VpcId
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 80
-          ToPort: 80
-          CidrIp: 0.0.0.0/0
-        - IpProtocol: tcp
-          FromPort: 8080
-          ToPort: 8080
-          CidrIp: 0.0.0.0/0
-
-  TaskSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: ECS tasks - allow HTTP from ALB
-      VpcId: !Ref VpcId
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 80
-          ToPort: 80
-          SourceSecurityGroupId: !Ref ALBSecurityGroup
-
-  ALB:
-    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
-    Properties:
-      Name: ecs-native-lab-alb
-      Subnets: !Ref SubnetIds
-      SecurityGroups: [!Ref ALBSecurityGroup]
-
-  # Two target groups ready for blue/green — both exist from the start
-  BlueTargetGroup:
-    Type: AWS::ElasticLoadBalancingV2::TargetGroup
-    Properties:
-      Name: ecs-native-lab-blue
-      Port: 80
-      Protocol: HTTP
-      VpcId: !Ref VpcId
-      TargetType: ip
-      HealthCheckPath: /
-      HealthCheckIntervalSeconds: 5
-      HealthyThresholdCount: 2
-      UnhealthyThresholdCount: 2
-      HealthCheckTimeoutSeconds: 3
-
-  GreenTargetGroup:
-    Type: AWS::ElasticLoadBalancingV2::TargetGroup
-    Properties:
-      Name: ecs-native-lab-green
-      Port: 80
-      Protocol: HTTP
-      VpcId: !Ref VpcId
-      TargetType: ip
-      HealthCheckPath: /
-      HealthCheckIntervalSeconds: 5
-      HealthyThresholdCount: 2
-      UnhealthyThresholdCount: 2
-      HealthCheckTimeoutSeconds: 3
-
-  # Production listener on port 80
-  ProductionListener:
-    Type: AWS::ElasticLoadBalancingV2::Listener
-    Properties:
-      LoadBalancerArn: !Ref ALB
-      Port: 80
-      Protocol: HTTP
-      DefaultActions:
-        - Type: forward
-          TargetGroupArn: !Ref BlueTargetGroup
-
-  # Test listener on port 8080 — used during blue/green for pre-production validation
-  TestListener:
-    Type: AWS::ElasticLoadBalancingV2::Listener
-    Properties:
-      LoadBalancerArn: !Ref ALB
-      Port: 8080
-      Protocol: HTTP
-      DefaultActions:
-        - Type: forward
-          TargetGroupArn: !Ref BlueTargetGroup
-
-  LogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: /ecs/native-deploy-lab
-      RetentionInDays: 7
-
-  TaskDefinition:
-    Type: AWS::ECS::TaskDefinition
-    Properties:
-      Family: ecs-native-deploy-lab
-      Cpu: '256'
-      Memory: '512'
-      NetworkMode: awsvpc
-      RequiresCompatibilities: [FARGATE]
-      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
-      ContainerDefinitions:
-        - Name: app
-          Image: public.ecr.aws/docker/library/node:20-alpine
-          Command:
-            - node
-            - -e
-            - |
-              const http = require('http');
-              const version = process.env.APP_VERSION || '1';
-              http.createServer((req, res) => {
-                res.writeHead(200, {'Content-Type': 'text/plain'});
-                res.end(`Hello World v${version}\n`);
-              }).listen(80);
-          Environment:
-            - Name: APP_VERSION
-              Value: '1'
-          PortMappings:
-            - ContainerPort: 80
-          Essential: true
-          LogConfiguration:
-            LogDriver: awslogs
-            Options:
-              awslogs-group: !Ref LogGroup
-              awslogs-region: !Ref AWS::Region
-              awslogs-stream-prefix: ecs
-
   # ECS infrastructure role — allows ECS to manage load balancer resources for blue/green
   ECSInfrastructureRole:
     Type: AWS::IAM::Role
@@ -830,7 +413,7 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonECSInfrastructureRolePolicyForLoadBalancers
 
-  # Service starts with default rolling update — no blue/green config yet
+  # Service starts with default rolling update — upgraded to blue/green via CLI
   Service:
     Type: AWS::ECS::Service
     DependsOn: ProductionListener
@@ -851,25 +434,9 @@ Resources:
         - ContainerName: app
           ContainerPort: 80
           TargetGroupArn: !Ref BlueTargetGroup
-
-Outputs:
-  ALBDns:
-    Value: !GetAtt ALB.DNSName
-  ClusterName:
-    Value: !Ref Cluster
-  ServiceName:
-    Value: !GetAtt Service.Name
-  ProductionListenerArn:
-    Value: !Ref ProductionListener
-  TestListenerArn:
-    Value: !Ref TestListener
-  BlueTargetGroupArn:
-    Value: !Ref BlueTargetGroup
-  GreenTargetGroupArn:
-    Value: !Ref GreenTargetGroup
-  ECSInfrastructureRoleArn:
-    Value: !GetAtt ECSInfrastructureRole.Arn
 ```
+
+That's it — no `CodeDeployApplication`, no `DeploymentGroup`, no `CodeDeployServiceRole`. The template also creates an `ECSInfrastructureRole` that ECS uses to manage ALB resources during blue/green deployments (replaces the CodeDeploy service role).
 
 Deploy the stack:
 
@@ -952,41 +519,7 @@ aws ecs wait services-stable --cluster ecs-native-deploy-lab --services native-d
 
 With blue/green enabled, you trigger a deployment by updating the service's task definition. No AppSpec, no `create-deployment` — just `update-service`:
 
-**`task-definition-v2.json`** (same app, different family name for the native lab):
-
-```json
-{
-  "family": "ecs-native-deploy-lab",
-  "cpu": "256",
-  "memory": "512",
-  "networkMode": "awsvpc",
-  "requiresCompatibilities": ["FARGATE"],
-  "executionRoleArn": "<EXECUTION_ROLE_ARN>",
-  "containerDefinitions": [
-    {
-      "name": "app",
-      "image": "public.ecr.aws/docker/library/node:20-alpine",
-      "command": [
-        "node", "-e",
-        "const http = require('http'); const version = process.env.APP_VERSION || '1'; http.createServer((req, res) => { res.writeHead(200, {'Content-Type': 'text/plain'}); res.end(`Hello World v${version}\\n`); }).listen(80);"
-      ],
-      "environment": [
-        { "name": "APP_VERSION", "value": "2" }
-      ],
-      "portMappings": [{ "containerPort": 80 }],
-      "essential": true,
-      "logConfiguration": {
-        "logDriver": "awslogs",
-        "options": {
-          "awslogs-group": "/ecs/native-deploy-lab",
-          "awslogs-region": "us-east-1",
-          "awslogs-stream-prefix": "ecs"
-        }
-      }
-    }
-  ]
-}
-```
+**[`task-definition-v2.json`](https://github.com/nuxero/ecs-deployment-strategies-lab/blob/main/native/task-definition-v2.json)** — same app as CodeDeploy but with family `ecs-native-deploy-lab`. Grab it from the companion repo (`native/task-definition-v2.json`).
 
 Register the task definition and update the service to trigger the deployment:
 
@@ -1084,8 +617,8 @@ Both configurations go inside `blueGreenDeploymentConfiguration` in the `--deplo
 
 Decision framework:
 - **Starting fresh?** → ECS Native. Same capabilities, less infrastructure, tighter integration.
-- Already invested in CodeDeploy pipelines? → CodeDeploy until you have a reason to migrate.
-- Dev environment, minimal config? → Rolling Update
+- **Already invested in CodeDeploy pipelines?** → CodeDeploy until you have a reason to migrate. Note that as of July 2025, you can [migrate existing CODE_DEPLOY services to the ECS controller](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/update-rolling-to-bluegreen.html) with `UpdateService` — no service recreation required.
+- **Dev environment, minimal config?** → Rolling Update
 
 ## Clean Up
 
@@ -1126,4 +659,11 @@ ECS provides three deployment strategies — rolling update for simplicity, Code
 
 The test listener pattern is the key safety mechanism for both blue/green approaches: validate the new version on port 8080 using real infrastructure before any production user on port 80 is affected. CodeDeploy uses `AfterAllowTestTraffic` hooks; ECS native uses `POST_TEST_TRAFFIC_SHIFT` Lambda hooks. Same concept, different wiring.
 
-For new deployments, ECS native is the simpler path — fewer resources to manage, native lifecycle hooks, and pause hooks for manual approval workflows. CodeDeploy remains relevant for teams with existing pipelines and deployment groups they don't want to migrate.
+For new deployments, ECS native is the default choice — fewer resources to manage, native lifecycle hooks with 8 stages (vs. CodeDeploy's 5), and pause hooks for manual approval workflows. CodeDeploy remains relevant for teams with existing pipelines and deployment groups they don't want to migrate yet.
+
+To go deeper:
+- [Amazon ECS blue/green deployments documentation](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/deployment-type-blue-green.html)
+- [Migrating from CodeDeploy to ECS native blue/green](https://aws.amazon.com/blogs/containers/migrating-from-aws-codedeploy-to-amazon-ecs-for-blue-green-deployments/)
+- [Companion repository with all lab files](https://github.com/nuxero/ecs-deployment-strategies-lab)
+
+Interested in choosing a deployment strategy for your application on ECS? [Let's talk](mailto:hector@agilityfeat.com)!

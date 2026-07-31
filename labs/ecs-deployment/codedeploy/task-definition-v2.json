@@ -1,5 +1,5 @@
 {
-  "family": "ecs-native-deploy-lab",
+  "family": "ecs-deploy-lab",
   "cpu": "256",
   "memory": "512",
   "networkMode": "awsvpc",
@@ -21,7 +21,7 @@
       "logConfiguration": {
         "logDriver": "awslogs",
         "options": {
-          "awslogs-group": "/ecs/native-deploy-lab",
+          "awslogs-group": "/ecs/deploy-lab",
           "awslogs-region": "us-east-1",
           "awslogs-stream-prefix": "ecs"
         }
