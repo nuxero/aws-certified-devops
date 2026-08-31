@@ -1,8 +1,8 @@
 # Deploying Lambda Functions Safely: SAM, CodeDeploy, Canary Strategies, and Automatic Rollback
 
-Lambda deployments are unlike anything else on AWS. No servers to manage, no agents to install, no files to be copied — deployment means publishing a new version of your function and shifting traffic to it. The risk: without safeguards, traffic shifts are instantaneous and all-or-nothing. One broken version = 100% of traffic affected. The solution is gradual traffic shifting with validation and automatic rollback. 
+Lambda deployments are unlike anything else on AWS. No servers to manage, no agents to install, no files to be copied — deployment means publishing a new version of your function and shifting traffic to it. The risk: without safeguards, traffic shifts are instantaneous and all-or-nothing. One broken version = 100% of traffic affected. The solution is gradual traffic shifting with validation and automatic rollback.
 
-In this post we'l take a look at three ways to do this: raw CodeDeploy, SAM `DeploymentPreference`, and CodePipeline V2's native Lambda deploy action.
+In this post we'll take a look at three ways to do this: raw CodeDeploy, SAM `DeploymentPreference`, and CodePipeline V2's native Lambda deploy action.
 
 ## Prerequisites
 
@@ -648,7 +648,7 @@ sed -i 's/v1/v2/' src/app.mjs
 sam build && sam deploy
 ```
 
-SAM automatically publishes a new version, creates a CodeDeploy deployment, and starts the canary shift. You can observe the deployment in the CodeDeploy console,
+SAM automatically publishes a new version, creates a CodeDeploy deployment, and starts the canary shift. You can observe the deployment in the CodeDeploy console.
 
 The developer workflow is: change code → `sam deploy` → everything else is automated.
 
@@ -777,3 +777,5 @@ aws iam delete-role --role-name lambda-hook-role
 Lambda deployments are about controlling traffic flow between immutable versions. CodeDeploy provides the mechanics: canary/linear shifting, pre-traffic hooks, alarm-based rollback. SAM wraps CodeDeploy into a declarative experience — `AutoPublishAlias` + `DeploymentPreference` handles everything from version publishing to traffic shifting to automatic rollback.
 
 The safety pattern: pre-traffic hook validates the new version functionally (can it handle a request?), CloudWatch alarm monitors runtime behavior during the canary window (is it erroring under real traffic?). Two layers of protection — one catches broken deploys before traffic shifts, the other catches issues that only surface under load.
+
+Interested in automating the deployment of your AWS Lambda-based applications? [Let's talk!](mailto:hector@agilityfeat.com)
