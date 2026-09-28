@@ -196,9 +196,9 @@ Key differences from EC2 AppSpec:
 
 The hook is a separate Lambda function that CodeDeploy invokes before shifting any traffic. It must:
 
-1. Invoke the new version
+1. Invoke the **new version** being deployed
 2. Validate the response
-3. Report success or failure back to CodeDeploy by calling `PutLifecycleEventHookExecutionStatus`
+3. Report success or failure back to CodeDeploy by calling `PutLifecycleEventHookExecutionStatus`.
 
 ```bash
 cat > pretraffic-hook.mjs << 'EOF'
@@ -217,19 +217,18 @@ export const handler = async (event) => {
   let status = "Failed";
 
   try {
-    // Step 1: Invoke the function through the alias
-    // During BeforeAllowTraffic, the alias still points to the current version
-    // This validates that the function is reachable and returns a well-formed response
+    console.log("Validating new version:", process.env.NEW_VERSION);
+
     const result = await lambda.send(new InvokeCommand({
-      FunctionName: "deploy-lab-function",
+      FunctionName: process.env.TARGET_FUNCTION,
       InvocationType: "RequestResponse",
-      Qualifier: "live",
+      Qualifier: process.env.NEW_VERSION,
     }));
 
     const payload = JSON.parse(Buffer.from(result.Payload).toString());
     const body = JSON.parse(payload.body);
 
-    // Step 2: Validate — check that the response has the expected structure
+    // Validate — check that the response has the expected structure
     if (payload.statusCode === 200 && body.version) {
       console.log("Validation passed:", body);
       status = "Succeeded";
@@ -241,7 +240,7 @@ export const handler = async (event) => {
     console.error("Validation failed — invocation error:", err);
   }
 
-  // Step 3: Report result to CodeDeploy — this determines whether traffic shifts proceed
+  // Report result to CodeDeploy — this determines whether traffic shifts proceed
   await codedeploy.send(new PutLifecycleEventHookExecutionStatusCommand({
     deploymentId,
     lifecycleEventHookExecutionId,
@@ -301,14 +300,16 @@ aws iam put-role-policy \
 HOOK_ROLE_ARN=$(aws iam get-role --role-name lambda-hook-role \
   --query 'Role.Arn' --output text)
 
-# Create the hook function with a 60-second timeout (gives it time to invoke + validate)
+# Create the hook function with a 60-second timeout (gives it time to invoke + validate).
+# TARGET_FUNCTION is fixed; NEW_VERSION is set per-deployment just before each deploy.
 aws lambda create-function \
   --function-name CodeDeployHook_deploy-lab-pretraffic \
   --runtime nodejs20.x \
   --handler pretraffic-hook.handler \
   --role $HOOK_ROLE_ARN \
   --zip-file fileb://pretraffic-hook.zip \
-  --timeout 60
+  --timeout 60 \
+  --environment "Variables={TARGET_FUNCTION=deploy-lab-function}"
 ```
 
 If the hook reports `Failed`, CodeDeploy rolls back immediately — no traffic ever reaches the new version.
@@ -339,11 +340,24 @@ aws lambda update-function-code \
 # Wait for the update to propagate (required before publishing)
 aws lambda wait function-updated --function-name deploy-lab-function
 
-# Publish version 2 — this is the version CodeDeploy will shift traffic to
-aws lambda publish-version \
+# Publish version 2 — this is the version CodeDeploy will shift traffic to.
+# Capture the version number so we can point the hook at it.
+NEW_VERSION=$(aws lambda publish-version \
   --function-name deploy-lab-function \
-  --query 'Version' --output text
-# Returns: 2
+  --query 'Version' --output text)
+echo "Published version: $NEW_VERSION"  # 2
+```
+
+Point the hook at the version being deployed. This is the step that makes the hook validate the *new* version rather than whatever the alias currently points at:
+
+```bash
+# Tell the hook which version to validate during BeforeAllowTraffic
+aws lambda update-function-configuration \
+  --function-name CodeDeployHook_deploy-lab-pretraffic \
+  --environment "Variables={TARGET_FUNCTION=deploy-lab-function,NEW_VERSION=$NEW_VERSION}"
+
+# Wait for the config update to settle before deploying
+aws lambda wait function-updated --function-name CodeDeployHook_deploy-lab-pretraffic
 ```
 
 Trigger the deployment. For Lambda, CodeDeploy accepts the AppSpec as inline JSON content (not an S3 file like EC2):
@@ -399,38 +413,19 @@ After 5 minutes, the canary period completes and the alias shifts 100% to versio
 
 ### Automatic Rollback
 
-Two layers of protection exist:
+Safe deployments rely on two layers of protection, but they are not equals:
 
-1. **Pre-traffic hooks** catch functional failures before any traffic shifts
-2. **CloudWatch alarms** catch runtime failures during the canary period
+1. **Pre-traffic hooks (the primary gate)** — validate the new version *before* any traffic shifts. If the hook fails, CodeDeploy rolls back immediately and no user ever touches the new version. This is the layer you control directly and can test deterministically.
+2. **CloudWatch alarms (the backstop)** — watch runtime metrics *during* traffic shifting. They catch problems the hook can't see: issues that only appear under real load, or non-functional regressions like latency, throttling, or memory pressure. They are essential, but they're reactive — they act after some traffic has already reached the new version.
 
-Create a CloudWatch alarm that fires when the Lambda function produces errors. Then update the deployment group to use this alarm and enable automatic rollback:
+We'll demonstrate the hook doing its job, then wire up the alarm as the supporting layer.
 
-```bash
-# Create alarm: fires if the function produces >= 1 error in a 60-second window
-aws cloudwatch put-metric-alarm \
-  --alarm-name deploy-lab-errors \
-  --namespace AWS/Lambda \
-  --metric-name Errors \
-  --statistic Sum \
-  --period 60 \
-  --threshold 1 \
-  --comparison-operator GreaterThanOrEqualToThreshold \
-  --evaluation-periods 1 \
-  --dimensions Name=FunctionName,Value=deploy-lab-function Name=Resource,Value=deploy-lab-function:live
+#### The hook catches a broken deploy
 
-# Attach alarm to deployment group and enable auto-rollback on alarm or failure
-aws deploy update-deployment-group \
-  --application-name lambda-deploy-lab \
-  --current-deployment-group-name canary-group \
-  --alarm-configuration enabled=true,alarms=[{name=deploy-lab-errors}] \
-  --auto-rollback-configuration enabled=true,events=DEPLOYMENT_FAILURE,DEPLOYMENT_STOP_ON_ALARM
-```
-
-Now deploy a broken version to see rollback in action. This version throws an error on every invocation:
+Deploy a version that's outright broken — it throws on every invocation:
 
 ```bash
-# Create a deliberately broken handler that always throws
+# A deliberately broken handler — every invocation throws
 cat > index.mjs << 'EOF'
 export const handler = async (event) => {
   throw new Error("Intentionally broken for rollback demo");
@@ -442,14 +437,21 @@ zip function.zip index.mjs
 # Update, wait, and publish version 3
 aws lambda update-function-code --function-name deploy-lab-function --zip-file fileb://function.zip
 aws lambda wait function-updated --function-name deploy-lab-function
-aws lambda publish-version --function-name deploy-lab-function --query 'Version' --output text
-# Returns: 3
+NEW_VERSION=$(aws lambda publish-version --function-name deploy-lab-function \
+  --query 'Version' --output text)
+echo "Published version: $NEW_VERSION"  # 3
+
+# Point the hook at v3 so it validates the new (broken) version
+aws lambda update-function-configuration \
+  --function-name CodeDeployHook_deploy-lab-pretraffic \
+  --environment "Variables={TARGET_FUNCTION=deploy-lab-function,NEW_VERSION=$NEW_VERSION}"
+aws lambda wait function-updated --function-name CodeDeployHook_deploy-lab-pretraffic
 ```
 
-Now set `CurrentVersion` and `TargetVersion` to 2 and 3 respectively and trigger the deployment. The hook invokes via the alias (which still points to v2 during `BeforeAllowTraffic`), so it passes. But once CodeDeploy shifts 10% of traffic to v3, those invocations throw errors, the CloudWatch alarm fires, and CodeDeploy rolls back automatically:
+Trigger the deployment. During `BeforeAllowTraffic`, the hook invokes v3, the invocation throws, the hook reports `Failed`, and CodeDeploy aborts before shifting any traffic:
 
 ```bash
-# Trigger deployment — hook will pass (validates via alias → v2), alarm will catch v3 errors
+# Trigger deployment — the hook will invoke v3, it throws, the hook fails the deployment
 DEPLOY_ID=$(aws deploy create-deployment \
   --application-name lambda-deploy-lab \
   --deployment-group-name canary-group \
@@ -458,18 +460,53 @@ DEPLOY_ID=$(aws deploy create-deployment \
 
 echo "Deployment: $DEPLOY_ID"
 
-# Poll — expect: BeforeAllowTraffic succeeds, then alarm fires during AllowTraffic
+# Poll — expect BeforeAllowTraffic to fail, then the deployment to roll back
 while true; do
   STATUS=$(aws deploy get-deployment --deployment-id $DEPLOY_ID \
     --query 'deploymentInfo.status' --output text)
   echo "$(date +%H:%M:%S) $STATUS"
-  # Exit loop when deployment is no longer in progress
   if [ "$STATUS" != "InProgress" ] && [ "$STATUS" != "Created" ]; then break; fi
   sleep 10
 done
 ```
 
-The deployment fails during `AllowTraffic` — the alarm detects errors from the 10% of traffic hitting v3 and triggers a rollback. The alias reverts to pointing 100% at version 2. This is the second layer of protection: the alarm catches issues that only surface under real traffic, even when the hook can't detect them in isolation.
+The deployment reaches `Failed` (or `Stopped`) within seconds — no five-minute canary wait, no traffic generator, no timing games. The `live` alias never leaves version 2. Confirm it:
+
+```bash
+# The alias should still point at version 2 — v3 never received any traffic
+aws lambda get-alias --function-name deploy-lab-function --name live \
+  --query '{Version: FunctionVersion, RoutingConfig: RoutingConfig}'
+```
+
+This is the whole point of a pre-traffic hook: a broken version is caught and rejected *before* it can affect a single request. Because we corrected the hook to validate the new version (not the alias), it actually sees v3's failure — the original alias-invoking version would have validated the healthy v2 and waved this broken deploy straight through.
+
+#### Wiring up the alarm as a backstop
+
+The hook can only catch what a synthetic invocation reveals. Some failures — a latency regression, elevated error rates under concurrency, memory pressure — only show up once real traffic flows. That's what the CloudWatch alarm layer is for. You attach an alarm to the deployment group, and CodeDeploy rolls back if it fires *during* traffic shifting:
+
+```bash
+# Create an alarm on the function's error count, scoped to the live alias
+aws cloudwatch put-metric-alarm \
+  --alarm-name deploy-lab-errors \
+  --namespace AWS/Lambda \
+  --metric-name Errors \
+  --statistic Sum \
+  --period 60 \
+  --threshold 1 \
+  --comparison-operator GreaterThanOrEqualToThreshold \
+  --evaluation-periods 1 \
+  --treat-missing-data notBreaching \
+  --dimensions Name=FunctionName,Value=deploy-lab-function Name=Resource,Value=deploy-lab-function:live
+
+# Attach the alarm to the deployment group and enable auto-rollback
+aws deploy update-deployment-group \
+  --application-name lambda-deploy-lab \
+  --current-deployment-group-name canary-group \
+  --alarm-configuration enabled=true,alarms=[{name=deploy-lab-errors}] \
+  --auto-rollback-configuration enabled=true,events=DEPLOYMENT_FAILURE,DEPLOYMENT_STOP_ON_ALARM
+```
+
+With this in place, a deployment that passes the hook but misbehaves under canary traffic will trip the alarm and roll back automatically.
 
 ## Approach 2 — SAM DeploymentPreference (The Real-World Workflow)
 
@@ -534,10 +571,13 @@ Resources:
               Action:
                 - lambda:InvokeFunction
               Resource: !Sub '${MyFunction.Arn}:*'
+            - Effect: Allow
+              Action:
+                - lambda:ListVersionsByFunction  # Resolve which version is being deployed
+              Resource: !GetAtt MyFunction.Arn
       Environment:
         Variables:
           TARGET_FUNCTION: !Ref MyFunction  # Resolves to the function name
-          TARGET_ALIAS: live
 
   # Alarm — triggers automatic rollback if errors occur during canary
   FunctionErrorsAlarm:
@@ -574,14 +614,35 @@ export const handler = async (event) => {
 };
 ```
 
-**`src/pretraffic.mjs`** — the hook function. Same logic as before but using environment variables for the function name and alias (injected by SAM from the template):
+**`src/pretraffic.mjs`** — the hook function. In the raw section we passed the exact version number to the hook as an env var, because we controlled `publish-version` ourselves. Here SAM owns publishing, so we don't know the version number at template time. Instead the hook resolves the newest published version at runtime with `ListVersionsByFunction` and invokes *that version* (not the alias, which still points at the old version during `BeforeAllowTraffic`). The function name comes from an environment variable injected by SAM:
 
 ```javascript
-import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
+import { LambdaClient, InvokeCommand, ListVersionsByFunctionCommand } from "@aws-sdk/client-lambda";
 import { CodeDeployClient, PutLifecycleEventHookExecutionStatusCommand } from "@aws-sdk/client-codedeploy";
 
 const lambda = new LambdaClient();
 const codedeploy = new CodeDeployClient();
+
+// Resolve the highest-numbered published version — that's the one being deployed
+const getNewestVersion = async (functionName) => {
+  let versions = [];
+  let marker;
+  do {
+    const page = await lambda.send(new ListVersionsByFunctionCommand({
+      FunctionName: functionName,
+      Marker: marker,
+    }));
+    versions.push(...page.Versions);
+    marker = page.NextMarker;
+  } while (marker);
+
+  return versions
+    .map((v) => v.Version)
+    .filter((v) => v !== "$LATEST")
+    .map(Number)
+    .sort((a, b) => b - a)[0]
+    .toString();
+};
 
 export const handler = async (event) => {
   // CodeDeploy passes these identifiers for reporting back
@@ -590,12 +651,19 @@ export const handler = async (event) => {
   let status = "Failed";
 
   try {
-    // Use environment variables instead of hardcoded names (set in template.yaml)
+    // Function name comes from the env var set in template.yaml
     const functionName = process.env.TARGET_FUNCTION;
+
+    // Invoke the NEW version directly — the alias still points at the old
+    // version during BeforeAllowTraffic, so validating the alias tests the
+    // wrong code.
+    const targetVersion = await getNewestVersion(functionName);
+    console.log("Validating new version:", targetVersion);
+
     const result = await lambda.send(new InvokeCommand({
       FunctionName: functionName,
       InvocationType: "RequestResponse",
-      Qualifier: process.env.TARGET_ALIAS,
+      Qualifier: targetVersion,
     }));
 
     const payload = JSON.parse(Buffer.from(result.Payload).toString());
@@ -776,6 +844,6 @@ aws iam delete-role --role-name lambda-hook-role
 
 Lambda deployments are about controlling traffic flow between immutable versions. CodeDeploy provides the mechanics: canary/linear shifting, pre-traffic hooks, alarm-based rollback. SAM wraps CodeDeploy into a declarative experience — `AutoPublishAlias` + `DeploymentPreference` handles everything from version publishing to traffic shifting to automatic rollback.
 
-The safety pattern: pre-traffic hook validates the new version functionally (can it handle a request?), CloudWatch alarm monitors runtime behavior during the canary window (is it erroring under real traffic?). Two layers of protection — one catches broken deploys before traffic shifts, the other catches issues that only surface under load.
+The safety pattern has a primary gate and a backstop. The pre-traffic hook is the primary gate: it validates the new version functionally (can it handle a request?) *before* any traffic shifts, and it's deterministic — a broken version is rejected in seconds, and no user is ever exposed. The CloudWatch alarm is the backstop: it monitors runtime behavior during the canary window and catches what a synthetic probe can't (latency, throttling, errors that only appear under real load). The alarm is reactive and subject to evaluation lag, so lean on the hook first and treat the alarm as the safety net behind it.
 
 Interested in automating the deployment of your AWS Lambda-based applications? [Let's talk!](mailto:hector@agilityfeat.com)

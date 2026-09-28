@@ -13,18 +13,18 @@ export const handler = async (event) => {
   let status = "Failed";
 
   try {
-    // Step 1: Invoke the new version through the alias
-    // During BeforeAllowTraffic, the alias briefly points to the new version for validation
+    console.log("Validating new version:", process.env.NEW_VERSION);
+
     const result = await lambda.send(new InvokeCommand({
-      FunctionName: "deploy-lab-function",
+      FunctionName: process.env.TARGET_FUNCTION,
       InvocationType: "RequestResponse",
-      Qualifier: "live",
+      Qualifier: process.env.NEW_VERSION,
     }));
 
     const payload = JSON.parse(Buffer.from(result.Payload).toString());
     const body = JSON.parse(payload.body);
 
-    // Step 2: Validate — check that the response has the expected structure
+    // Validate — check that the response has the expected structure
     if (payload.statusCode === 200 && body.version) {
       console.log("Validation passed:", body);
       status = "Succeeded";
@@ -32,10 +32,11 @@ export const handler = async (event) => {
       console.error("Validation failed — unexpected response:", payload);
     }
   } catch (err) {
+    // Catches invocation errors (e.g., function doesn't exist, timeout)
     console.error("Validation failed — invocation error:", err);
   }
 
-  // Step 3: Report result to CodeDeploy — this determines whether traffic shifts proceed
+  // Report result to CodeDeploy — this determines whether traffic shifts proceed
   await codedeploy.send(new PutLifecycleEventHookExecutionStatusCommand({
     deploymentId,
     lifecycleEventHookExecutionId,
