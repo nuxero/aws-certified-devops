@@ -9,7 +9,7 @@ CloudFormation provides two composition patterns for multi-stack architectures:
 
 These patterns are not interchangeable. Cross-stack references give you independence at the cost of manual dependency tracking. Nested stacks give you coordinated deployment at the cost of coupling. Choosing wrong creates tight coupling where you want freedom, or fragmentation where you want coordination.
 
-This post assumes you have the VPC stack from the [CloudFormation from Scratch](cloudformation-from-scratch-vpc.md) post deployed with the stack name `dev-vpc`. We'll import its exports to build layered infrastructure on top.
+This post assumes you have the VPC stack from the [CloudFormation from Scratch](https://builder.aws.com/content/3GamoTD5mMBFcWf2ORBQcEmKV4c/cloudformation-from-scratch-building-a-production-ready-vpc-step-by-step) post deployed with the stack name `dev-vpc`. We'll import its exports to build layered infrastructure on top.
 
 ## Cross-Stack References — Export and ImportValue
 
@@ -157,18 +157,7 @@ graph LR
 
 ### The Deletion Dependency
 
-Cross-stack references create an implicit protection mechanism. Try to delete the VPC stack while the SG stack is importing its exports:
-
-```bash
-aws cloudformation delete-stack --stack-name dev-vpc
-```
-
-This will fail with:
-
-```
-An error occurred (ValidationError) when calling the DeleteStack operation:
-Export dev-vpc-VpcId cannot be deleted as it is in use by dev-security-groups
-```
+Cross-stack references create an implicit protection mechanism. If you attempt to delete the VPC stack while the SG stack is still importing its exports, CloudFormation rejects the request up front with a `ValidationError`.
 
 CloudFormation prevents deleting a stack whose exports are consumed by other stacks. This is a feature, not a bug — it stops someone from accidentally pulling the network out from under running application infrastructure.
 
@@ -200,7 +189,7 @@ aws cloudformation delete-stack --stack-name dev-vpc
 aws cloudformation wait stack-delete-complete --stack-name dev-vpc
 ```
 
-### Limitations and Alternatives
+### Limitations
 
 `Fn::ImportValue` has constraints that matter in practice:
 
@@ -208,21 +197,6 @@ aws cloudformation wait stack-delete-complete --stack-name dev-vpc
 - **Same-account only** — cross-account references are not supported.
 - **Cannot use inside `!If` or `Fn::If`** — `!ImportValue` doesn't work inside condition expressions. You can't conditionally import a value.
 - **Creates hard coupling** — the import/export contract is rigid. Renaming an export requires coordinating with all consumers.
-
-For scenarios where these limitations bite, there are alternatives:
-
-**[Fn::GetStackOutput](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/intrinsic-function-reference-getstackoutput.html)** — this intrinsic function references any stack output across accounts and Regions without requiring the source stack to declare an `Export`. It creates a weak reference resolved at deploy time. This is the modern replacement for cross-Region/cross-account sharing:
-
-```yaml
-# Reference an output from a stack in another account/Region
-VpcId: !GetStackOutput
-  StackName: 'arn:aws:cloudformation:us-west-2:111111111111:stack/prod-vpc/abc123'
-  OutputKey: VpcId
-```
-
-**SSM Parameter Store** — write the value to a parameter in the source account/Region, read it from the target. Works cross-Region and cross-account (with IAM permissions). Adds a runtime dependency on the parameter existing.
-
-**CI/CD pipeline parameters** — the pipeline reads outputs from one stack and passes them as parameters to the next. No CloudFormation coupling at all, but requires pipeline orchestration.
 
 ## Nested Stacks — Same Lifecycle Composition
 
@@ -260,7 +234,7 @@ graph TB
 
 ### Example: VPC + Security Groups as Nested Stacks
 
-The VPC template from Post #1 already works as a nested child — it accepts parameters and produces outputs. But the security groups template needs a small change for nested use: instead of `!ImportValue` (which creates a cross-stack reference), it receives the VPC ID as a parameter from the parent. Save this as `security-groups-nested.yaml`:
+The VPC template from before already works as a nested child — it accepts parameters and produces outputs. But the security groups template needs a small change for nested use: instead of `!ImportValue` (which creates a cross-stack reference), it receives the VPC ID as a parameter from the parent. Save this as `security-groups-nested.yaml`:
 
 ```yaml
 AWSTemplateFormatVersion: '2010-09-09'
@@ -406,98 +380,6 @@ When you deploy the parent, CloudFormation creates the children in dependency or
 
 **Rule of thumb:** If different teams own the stacks or they update on different schedules, use cross-stack references. If the same team owns everything and it deploys as a unit, use nested stacks.
 
-## Stack Policies — Protecting Critical Resources
-
-### What Stack Policies Do
-
-Stack policies prevent accidental replacement or deletion of critical resources during stack updates. Without a policy, `update-stack` can replace any resource — including your production VPC, database, or encryption key — if the update requires it.
-
-A stack policy is a JSON document attached to a stack that specifies which update actions are allowed on which resources. Key behaviors:
-
-- Once set, a stack policy **cannot be removed** — only replaced with a new one
-- Without a policy, the default is: all update actions allowed on all resources
-- With a policy, the default flips: **all updates are denied** unless explicitly allowed
-- Policies are evaluated during `update-stack` and `execute-change-set` operations
-
-### Applying a Stack Policy
-
-Set a stack policy on the VPC stack that allows all modifications but prevents replacement of the VPC resource itself. This protects against CIDR changes that would trigger VPC recreation:
-
-```bash
-aws cloudformation set-stack-policy \
-  --stack-name dev-vpc \
-  --stack-policy-body '{
-    "Statement": [
-      {
-        "Effect": "Allow",
-        "Action": "Update:*",
-        "Principal": "*",
-        "Resource": "*"
-      },
-      {
-        "Effect": "Deny",
-        "Action": "Update:Replace",
-        "Principal": "*",
-        "Resource": "LogicalResourceId/VPC"
-      }
-    ]
-  }'
-```
-
-The policy structure:
-
-- **`Effect`** — `Allow` or `Deny`
-- **`Action`** — what update action to control: `Update:Modify` (in-place changes), `Update:Replace` (destroy and recreate), `Update:Delete` (remove the resource), or `Update:*` (all)
-- **`Principal`** — always `"*"` (stack policies don't support IAM principal filtering)
-- **`Resource`** — which logical resources: `LogicalResourceId/VPC` for a specific resource, or `LogicalResourceId/*` for all resources
-
-The statements are evaluated together. If both Allow and Deny apply to the same action on the same resource, **Deny wins** (just like IAM policies). So our policy says: allow all update actions on all resources, except deny replacement of the VPC.
-
-Verify the policy is in place:
-
-```bash
-aws cloudformation get-stack-policy --stack-name dev-vpc
-```
-
-```json
-{
-    "StackPolicyBody": "{\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"Update:*\",\"Principal\":\"*\",\"Resource\":\"*\"},{\"Effect\":\"Deny\",\"Action\":\"Update:Replace\",\"Principal\":\"*\",\"Resource\":\"LogicalResourceId/VPC\"}]}"
-}
-```
-
-Now if someone tries to change the VPC CIDR (which requires replacement), the update fails:
-
-```
-Resource handler returned message: "Action denied by stack policy:
-Update:Replace on resource LogicalResourceId/VPC"
-```
-
-### Temporarily Overriding a Stack Policy
-
-Sometimes you legitimately need to replace a protected resource — a planned migration, a CIDR block change, or a resource rename. Stack policies support a temporary override that applies only to a single update operation:
-
-```bash
-aws cloudformation update-stack \
-  --stack-name dev-vpc \
-  --template-body file://vpc.yaml \
-  --parameters ParameterKey=Environment,ParameterValue=dev \
-               ParameterKey=VpcCidr,ParameterValue=10.1.0.0/16 \
-  --stack-policy-during-update-body '{
-    "Statement": [
-      {
-        "Effect": "Allow",
-        "Action": "Update:*",
-        "Principal": "*",
-        "Resource": "*"
-      }
-    ]
-  }'
-```
-
-The `--stack-policy-during-update-body` temporarily permits all actions for this specific update. Once the update completes (or fails), the original restrictive policy is back in effect. The override is never persisted.
-
-This separation of concerns is deliberate: the stack policy protects against accidents, but doesn't prevent intentional changes by someone who explicitly overrides it. For true prevention, combine stack policies with IAM policies that deny `cloudformation:SetStackPolicy` for non-admin roles.
-
 ## Clean Up
 
 Delete resources in dependency order — consumers first, then providers:
@@ -509,7 +391,7 @@ ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 aws cloudformation delete-stack --stack-name dev-infrastructure
 aws cloudformation wait stack-delete-complete --stack-name dev-infrastructure
 
-# 2. Delete cross-stack demo stacks in dependency order (consumers first)
+# 2. Delete cross-stack demo stacks in dependency order if not done already
 aws cloudformation delete-stack --stack-name dev-security-groups
 aws cloudformation wait stack-delete-complete --stack-name dev-security-groups
 
@@ -524,19 +406,11 @@ aws s3 rb s3://cfn-templates-${ACCOUNT_ID} --force
 
 We've covered the two patterns CloudFormation provides for composing infrastructure beyond a single stack:
 
-**Cross-stack references** connect independent stacks within a Region. The VPC stack exports its IDs, the security group stack imports them. Each stack has its own lifecycle, owned by different teams, updated independently. The export/import contract creates a deletion dependency that prevents accidental breakage — and stack policies extend that protection to updates, preventing accidental replacement of critical resources.
+**Cross-stack references** connect independent stacks within a Region. The VPC stack exports its IDs, the security group stack imports them. Each stack has its own lifecycle, owned by different teams, updated independently. The export/import contract creates a deletion dependency that prevents accidental breakage.
 
 **Nested stacks** group related resources under a parent. Same team, same lifecycle, deployed as a unit. The parent handles creation order, parameter passing, and deletion. Templates must live in S3. Use nested stacks for reusable modules and for exceeding the 500-resource limit.
 
 The decision between them comes down to ownership and lifecycle. If different teams own the stacks or they update independently, use cross-stack references. If the same team owns everything and it deploys as a unit, use nested stacks.
 
-### DOP-C02 Exam Tips
-
-- **Deletion dependency** — you cannot delete a stack whose exports are imported by another stack. `list-imports` shows consumers.
-- **Export uniqueness** — export names must be unique per Region per account, not per stack.
-- **`Fn::ImportValue` limitations** — same-Region only, cannot be used inside `!If` conditions.
-- **`Fn::GetStackOutput`** — the newer alternative to `Fn::ImportValue` that works cross-account and cross-Region without requiring exports.
-- **Nested stack templates must be in S3** — local paths don't work for `TemplateURL`.
-- **Stack policies can't be removed** — only replaced. Default with a policy: deny all unless explicitly allowed.
-- **Stack policy override** — `--stack-policy-during-update-body` is temporary, applies to one update only.
+Looking into re-using cloudformation stacks or distributing across management across multiple teams? [Let's talk](mailto:hector@agilityfeat.com)!
 

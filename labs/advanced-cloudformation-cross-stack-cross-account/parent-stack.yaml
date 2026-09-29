@@ -1,0 +1,44 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Parent stack that deploys VPC and Security Groups as nested stacks.
+  Demonstrates same-lifecycle composition.
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: dev
+    Description: Target environment
+
+  TemplateBucket:
+    Type: String
+    Description: S3 bucket containing the nested stack templates
+
+Resources:
+  # Nested VPC stack — deploys the full VPC infrastructure
+  # Parameters flow from parent to child via the Parameters property
+  VPCStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${TemplateBucket}.s3.amazonaws.com/nested/vpc.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        EnableNatGateway: 'false'
+
+  # Nested Security Groups stack — receives VPC ID from the VPC child's output
+  # !GetAtt retrieves outputs from the nested stack using Outputs.OutputName syntax
+  SecurityGroupsStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${TemplateBucket}.s3.amazonaws.com/nested/security-groups.yaml'
+      Parameters:
+        VpcId: !GetAtt VPCStack.Outputs.VpcId
+
+Outputs:
+  VpcId:
+    Description: VPC ID from the nested VPC stack
+    Value: !GetAtt VPCStack.Outputs.VpcId
+
+  WebServerSGId:
+    Description: Web server security group from the nested SG stack
+    Value: !GetAtt SecurityGroupsStack.Outputs.WebServerSecurityGroupId

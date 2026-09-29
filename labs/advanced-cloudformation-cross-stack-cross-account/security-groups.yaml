@@ -1,0 +1,65 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Layered security groups that import VPC ID from an existing stack.
+  Demonstrates cross-stack references with Fn::ImportValue.
+
+Parameters:
+  # The name of the VPC stack whose exports we consume
+  # This makes the template flexible — works with any VPC stack that follows the export naming convention
+  NetworkStackName:
+    Type: String
+    Default: dev-vpc
+    Description: Name of the VPC stack to import from
+
+Resources:
+  # Web-tier security group — allows HTTP and HTTPS from anywhere
+  # Uses Fn::ImportValue with Fn::Sub to dynamically resolve the export name
+  WebServerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP/HTTPS from the internet
+      VpcId: !ImportValue
+        Fn::Sub: '${NetworkStackName}-VpcId'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Name
+          Value: WebServerSG
+
+  # App-tier security group — only accepts traffic from the web tier on port 8080
+  # The SourceSecurityGroupId reference creates a chain: internet → WebServerSG → AppServerSG
+  AppServerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow port 8080 from web tier only
+      VpcId: !ImportValue
+        Fn::Sub: '${NetworkStackName}-VpcId'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref WebServerSG
+      Tags:
+        - Key: Name
+          Value: AppServerSG
+
+Outputs:
+  # Export SG IDs so further downstream stacks can reference them
+  WebServerSecurityGroupId:
+    Description: Web server security group ID
+    Value: !Ref WebServerSG
+    Export:
+      Name: !Sub '${AWS::StackName}-WebServerSGId'
+
+  AppServerSecurityGroupId:
+    Description: App server security group ID
+    Value: !Ref AppServerSG
+    Export:
+      Name: !Sub '${AWS::StackName}-AppServerSGId'
