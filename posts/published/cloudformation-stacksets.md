@@ -627,14 +627,3 @@ The two permission models serve different organizational contexts. Self-managed 
 Deployment controls (concurrency, failure tolerance, Region ordering) give you the safety knobs for production rollouts. Start conservative, widen the blast radius as you gain confidence in a template.
 
 The pattern that ties it all together: service-managed StackSets with auto-deployment targeting your organization's root OU. Every account, present and future, receives your security baseline automatically. That's how you enforce guardrails at scale without a human in the loop.
-
-### DOP-C02 Exam Tips
-
-- **Self-managed vs. service-managed** — self-managed uses explicit IAM roles (`AWSCloudFormationStackSetAdministrationRole` + `AWSCloudFormationStackSetExecutionRole`). Service-managed uses Organizations trusted access with automatic role creation.
-- **Auto-deployment** — only available with service-managed permissions. Deploys to new accounts joining a target OU.
-- **`--no-retain-stacks`** — required on `delete-stack-instances` to actually delete the underlying stacks. Without it, resources persist.
-- **`MaxConcurrentCount` / `FailureToleranceCount`** — control deployment speed and rollback threshold. Know both the count and percentage variants.
-- **Region ordering** — StackSets deploys to Regions in the order specified. `SEQUENTIAL` finishes one Region before starting the next.
-- **`OUTDATED` vs. `CURRENT`** — `OUTDATED` means a stack instance hasn't received the latest template update yet.
-- **Delegated administrator** — allows a non-management account to manage service-managed StackSets.
-- **Parameter overrides** — per-instance parameter values that persist through StackSet updates.

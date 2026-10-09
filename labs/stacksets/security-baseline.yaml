@@ -1,0 +1,44 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Security baseline — encrypted S3 bucket for audit logs.
+  Deployed via StackSets to multiple Regions.
+
+Resources:
+  # One audit log bucket per Region — data residency compliant
+  # The bucket name includes Region to ensure uniqueness across targets
+  AuditLogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'audit-logs-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveToGlacier
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+      Tags:
+        - Key: Purpose
+          Value: SecurityAuditLogs
+        - Key: ManagedBy
+          Value: StackSets
+
+Outputs:
+  BucketName:
+    Description: Name of the audit log bucket
+    Value: !Ref AuditLogBucket
+
+  BucketArn:
+    Description: ARN of the audit log bucket
+    Value: !GetAtt AuditLogBucket.Arn

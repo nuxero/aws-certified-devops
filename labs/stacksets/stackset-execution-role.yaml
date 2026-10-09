@@ -1,0 +1,24 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: StackSet execution role (deploy in each target account)
+
+Parameters:
+  AdministratorAccountId:
+    Type: String
+    Description: The AWS account ID of the StackSet administrator account
+
+Resources:
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWSCloudFormationStackSetExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AdministratorAccountId}:root'
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # AdministratorAccess for the lab — scope this down in production
+        # to only the permissions your StackSet template needs
+        - arn:aws:iam::aws:policy/AdministratorAccess
