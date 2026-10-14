@@ -515,3 +515,5 @@ CodeArtifact sits between your source code and your builds — a single control 
 3. **Governance** — every package operation is logged in CloudTrail. Cross-account sharing via domain policies gives you centralized control with distributed consumption.
 
 The setup is minimal: a domain, an upstream repository with an external connection, and a team-facing repository. Point your package manager at it with `aws codeartifact login`, and everything else — caching, deduplication, encryption, audit logging — happens automatically.
+
+Are you looking to improve your software delivery practice with security, governance and observability? [Let's talk!](mailto:hector@agilityfeat.com)
